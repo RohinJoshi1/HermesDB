@@ -127,4 +127,21 @@ class TableIterator final : public StorageIterator {
   std::unique_ptr<BlockIterator> block_iter_;
 };
 
+class ConcatIterator final : public StorageIterator {
+ public:
+  explicit ConcatIterator(std::vector<std::shared_ptr<const Table>> tables);
+  [[nodiscard]] bool valid() const noexcept override;
+  [[nodiscard]] ByteView key() const override;
+  [[nodiscard]] ByteView value() const override;
+  void next() override;
+  void seek_to_first();
+  void seek(ByteView target);
+
+ private:
+  void open_table(std::size_t index, const ByteView* target);
+  std::vector<std::shared_ptr<const Table>> tables_;
+  std::size_t index_{};
+  std::unique_ptr<TableIterator> child_;
+};
+
 }  // namespace tiny_lsm

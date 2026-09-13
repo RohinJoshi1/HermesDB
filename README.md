@@ -35,8 +35,9 @@ The accelerated schedule is:
 10. Week 3 Days 5–6: transaction workspaces, atomic commits, and validation.
 11. Week 3 Day 7: compaction filters, integration tests, and final review.
 
-Days 1–7 of Week 1 are complete. The next workday is **Week 2 Days 1–2**,
-beginning with compaction.
+Days 1–7 of Week 1 are complete. The current workday is **Week 2 Days 1–2**:
+full compaction to L1, a background flush thread, then simple leveled
+compaction.
 
 For each accelerated workday:
 

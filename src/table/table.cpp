@@ -352,4 +352,65 @@ void TableIterator::open_block(std::size_t index, const ByteView* target) {
   }
 }
 
+ConcatIterator::ConcatIterator(std::vector<std::shared_ptr<const Table>> tables)
+    : tables_(std::move(tables)) {}
+
+bool ConcatIterator::valid() const noexcept {
+  return child_ && child_->valid();
+}
+
+ByteView ConcatIterator::key() const {
+  if (!valid()) throw Error("iterator is invalid");
+  return child_->key();
+}
+
+ByteView ConcatIterator::value() const {
+  if (!valid()) throw Error("iterator is invalid");
+  return child_->value();
+}
+
+void ConcatIterator::next() {
+  if (!valid()) return;
+  child_->next();
+  if (!child_->valid()) {
+    open_table(index_ + 1, nullptr);
+  }
+}
+
+void ConcatIterator::seek_to_first() { open_table(0, nullptr); }
+
+void ConcatIterator::seek(ByteView target) {
+  if (tables_.empty()) {
+    child_.reset();
+    return;
+  }
+  const auto it = std::lower_bound(
+      tables_.begin(), tables_.end(), target,
+      [](const std::shared_ptr<const Table>& table, ByteView wanted) {
+        return bytes_less(table->last_key(), wanted);
+      });
+  if (it == tables_.end()) {
+    child_.reset();
+    return;
+  }
+  open_table(static_cast<std::size_t>(it - tables_.begin()), &target);
+}
+
+void ConcatIterator::open_table(std::size_t index, const ByteView* target) {
+  if (index >= tables_.size() || !tables_[index]) {
+    child_.reset();
+    return;
+  }
+  index_ = index;
+  child_ = std::make_unique<TableIterator>(tables_[index]);
+  if (target != nullptr) {
+    child_->seek(*target);
+  } else {
+    child_->seek_to_first();
+  }
+  if (!child_->valid() && index + 1 < tables_.size()) {
+    open_table(index + 1, nullptr);
+  }
+}
+
 }  // namespace tiny_lsm
