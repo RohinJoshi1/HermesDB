@@ -1,5 +1,6 @@
 #include "tiny_lsm/common.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace tiny_lsm {
@@ -10,6 +11,20 @@ ByteView as_bytes(std::string_view value) noexcept {
 
 std::string as_string(ByteView value) {
   return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+
+bool bytes_less(ByteView lhs, ByteView rhs) noexcept {
+  return std::lexicographical_compare(lhs.begin(), lhs.end(), rhs.begin(),
+                                      rhs.end());
+}
+
+bool bytes_equal(ByteView lhs, ByteView rhs) noexcept {
+  return lhs.size() == rhs.size() &&
+         std::equal(lhs.begin(), lhs.end(), rhs.begin());
+}
+
+bool bytes_less_equal(ByteView lhs, ByteView rhs) noexcept {
+  return bytes_less(lhs, rhs) || bytes_equal(lhs, rhs);
 }
 
 void put_u16(Bytes& out, std::uint16_t value) {

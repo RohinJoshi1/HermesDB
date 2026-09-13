@@ -13,8 +13,8 @@ namespace tiny_lsm {
 
 struct BlockMeta {
   std::uint32_t offset{};
-  InternalKey first_key;
-  InternalKey last_key;
+  Bytes first_key;
+  Bytes last_key;
 };
 
 class BloomFilter {
@@ -63,7 +63,7 @@ class BlockCache {
   std::mutex mutex_;
 };
 
-class Table {
+class Table : public std::enable_shared_from_this<Table> {
  public:
   [[nodiscard]] static std::shared_ptr<Table> open(Bytes encoded);
   [[nodiscard]] ByteView bytes() const noexcept { return bytes_; }
@@ -71,28 +71,30 @@ class Table {
     return meta_;
   }
   [[nodiscard]] std::size_t num_blocks() const noexcept { return meta_.size(); }
-  [[nodiscard]] std::uint64_t max_timestamp() const noexcept {
-    return max_timestamp_;
-  }
+  [[nodiscard]] ByteView first_key() const noexcept;
+  [[nodiscard]] ByteView last_key() const noexcept;
   [[nodiscard]] bool may_contain(ByteView user_key) const noexcept;
+  [[nodiscard]] std::optional<Bytes> get(ByteView key) const;
   [[nodiscard]] std::shared_ptr<const Block> read_block(std::size_t index) const;
-  [[nodiscard]] std::size_t find_block(const InternalKey& key) const;
+  [[nodiscard]] std::shared_ptr<const Block> read_block_cached(
+      std::size_t index, std::uint64_t table_id, BlockCache& cache) const;
+  [[nodiscard]] std::size_t find_block(ByteView key) const;
   [[nodiscard]] IteratorPtr iter() const;
+  [[nodiscard]] IteratorPtr iter_from(ByteView key) const;
 
  private:
   Table(Bytes bytes, std::vector<BlockMeta> meta, std::uint32_t meta_offset,
-        BloomFilter bloom, std::uint64_t max_timestamp);
+        BloomFilter bloom);
   Bytes bytes_;
   std::vector<BlockMeta> meta_;
   std::uint32_t meta_offset_{};
   BloomFilter bloom_;
-  std::uint64_t max_timestamp_{};
 };
 
 class TableBuilder {
  public:
   explicit TableBuilder(std::size_t block_size);
-  void add(const InternalKey& key, ByteView value);
+  void add(ByteView key, ByteView value);
   [[nodiscard]] bool empty() const noexcept;
   [[nodiscard]] Bytes finish();
 
@@ -102,11 +104,27 @@ class TableBuilder {
   BlockBuilder block_;
   Bytes data_;
   std::vector<BlockMeta> meta_;
-  std::optional<InternalKey> first_key_;
-  std::optional<InternalKey> last_key_;
-  std::optional<InternalKey> previous_key_;
+  std::optional<Bytes> first_key_;
+  std::optional<Bytes> last_key_;
+  std::optional<Bytes> previous_key_;
   std::vector<std::uint32_t> key_hashes_;
-  std::uint64_t max_timestamp_{};
+};
+
+class TableIterator final : public StorageIterator {
+ public:
+  explicit TableIterator(std::shared_ptr<const Table> table);
+  [[nodiscard]] bool valid() const noexcept override;
+  [[nodiscard]] ByteView key() const override;
+  [[nodiscard]] ByteView value() const override;
+  void next() override;
+  void seek_to_first();
+  void seek(ByteView target);
+
+ private:
+  void open_block(std::size_t index, const ByteView* target);
+  std::shared_ptr<const Table> table_;
+  std::size_t block_index_{};
+  std::unique_ptr<BlockIterator> block_iter_;
 };
 
 }  // namespace tiny_lsm

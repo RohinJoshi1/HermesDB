@@ -1,20 +1,35 @@
 #include "tiny_lsm/memtable.hpp"
 
+#include <mutex>
+
 namespace tiny_lsm {
 
-void MemTable::put(ByteView, ByteView) {
-  // TODO(week1-day1): insert/overwrite under mutex_ and update
-  // approximate_size_. Empty values are tombstones and must be retained.
-  throw Error("TODO(week1-day1): MemTable::put");
+void MemTable::put(ByteView key_view, ByteView value_view) {
+  Bytes key(key_view.begin(), key_view.end());
+  Bytes value(value_view.begin(), value_view.end());
+  std::unique_lock lock(mutex_);
+
+  auto it = entries_.find(key);
+  if (it != entries_.end()) {
+    approximate_size_ -= it->second.size();
+    approximate_size_ += value.size();
+    it->second = std::move(value);
+  } else {
+    approximate_size_ += key.size() + value.size();
+    entries_.emplace(std::move(key), std::move(value));
+  }
 }
 
 void MemTable::put(std::string_view key, std::string_view value) {
   put(as_bytes(key), as_bytes(value));
 }
 
-std::optional<Bytes> MemTable::get(ByteView) const {
-  // TODO(week1-day1): look up the owned user key under a shared lock.
-  throw Error("TODO(week1-day1): MemTable::get");
+std::optional<Bytes> MemTable::get(ByteView key_view) const {
+  Bytes key(key_view.begin(), key_view.end());
+  std::shared_lock lock(mutex_);
+  auto it = entries_.find(key);
+  if (it == entries_.end()) return std::nullopt;
+  return it->second;
 }
 
 std::optional<Bytes> MemTable::get(std::string_view key) const {
@@ -22,19 +37,18 @@ std::optional<Bytes> MemTable::get(std::string_view key) const {
 }
 
 std::vector<std::pair<Bytes, Bytes>> MemTable::entries() const {
-  // TODO(week1-day1): copy entries_ in map order under a shared lock.
-  throw Error("TODO(week1-day1): MemTable::entries");
+  std::shared_lock lock(mutex_);
+  return {entries_.begin(), entries_.end()};
 }
 
 std::size_t MemTable::approximate_size() const {
-  // TODO(week1-day1): read approximate_size_ under a shared lock.
-  (void)approximate_size_;
-  throw Error("TODO(week1-day1): MemTable::approximate_size");
+  std::shared_lock lock(mutex_);
+  return approximate_size_;
 }
 
 bool MemTable::empty() const {
-  // TODO(week1-day1): inspect entries_ under a shared lock.
-  throw Error("TODO(week1-day1): MemTable::empty");
+  std::shared_lock lock(mutex_);
+  return entries_.empty();
 }
 
 }  // namespace tiny_lsm

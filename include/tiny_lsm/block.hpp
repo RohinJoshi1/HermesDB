@@ -25,7 +25,7 @@ class Block {
 class BlockBuilder {
  public:
   explicit BlockBuilder(std::size_t target_size);
-  [[nodiscard]] bool add(const InternalKey& key, ByteView value);
+  [[nodiscard]] bool add(ByteView key, ByteView value);
   [[nodiscard]] bool empty() const noexcept { return offsets_.empty(); }
   [[nodiscard]] std::size_t estimated_size() const noexcept;
   [[nodiscard]] std::shared_ptr<Block> finish();
@@ -41,17 +41,17 @@ class BlockIterator final : public StorageIterator {
  public:
   explicit BlockIterator(std::shared_ptr<const Block> block);
   [[nodiscard]] bool valid() const noexcept override;
-  [[nodiscard]] const InternalKey& key() const override;
+  [[nodiscard]] ByteView key() const override;
   [[nodiscard]] ByteView value() const override;
   void next() override;
   void seek_to_first();
-  void seek(const InternalKey& target);
+  void seek(ByteView target);
 
  private:
   void decode_entry(std::size_t index);
   std::shared_ptr<const Block> block_;
   std::size_t index_{};
-  InternalKey key_;
+  Bytes key_;
   Bytes first_key_;
   ByteView value_;
   bool valid_{};

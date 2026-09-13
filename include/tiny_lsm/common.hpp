@@ -23,6 +23,9 @@ class Error : public std::runtime_error {
 
 [[nodiscard]] ByteView as_bytes(std::string_view value) noexcept;
 [[nodiscard]] std::string as_string(ByteView value);
+[[nodiscard]] bool bytes_less(ByteView lhs, ByteView rhs) noexcept;
+[[nodiscard]] bool bytes_equal(ByteView lhs, ByteView rhs) noexcept;
+[[nodiscard]] bool bytes_less_equal(ByteView lhs, ByteView rhs) noexcept;
 
 void put_u16(Bytes& out, std::uint16_t value);
 void put_u32(Bytes& out, std::uint32_t value);

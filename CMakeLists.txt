@@ -8,7 +8,10 @@ set(TINY_LSM_SANITIZER "" CACHE STRING "Sanitizer: address, undefined, thread, o
 add_library(tiny_lsm
   src/common/common.cpp
   src/memtable/memtable.cpp
+  src/iterators/iterators.cpp
   src/storage/db.cpp
+  src/block/block.cpp
+  src/table/table.cpp
 )
 add_library(tiny_lsm::tiny_lsm ALIAS tiny_lsm)
 add_library(tiny_lsm_mvcc ALIAS tiny_lsm)
