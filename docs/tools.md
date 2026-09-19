@@ -5,7 +5,7 @@
 Start the CLI with a database directory and policy:
 
 ```sh
-tiny_lsm_cli --path scratch.db --compaction leveled --enable-wal
+hermesdb_cli --path scratch.db --compaction leveled --enable-wal
 ```
 
 Add `--serializable` to enable serializable validation for transactions opened
@@ -41,7 +41,7 @@ not flushing or persistence.
 ## Compaction simulator
 
 The simulator creates one unit-sized mock SST per iteration and models file
-placement. It neither opens a `MiniLsm` database nor creates real SST data:
+placement. It neither opens a `DB` database nor creates real SST data:
 
 ```sh
 compaction_simulator --policy all
@@ -75,3 +75,34 @@ and actual byte overlap. They should not be used as database benchmarks.
 Use a fixed `--seed` when comparing policies. Leveled simulation generates
 repeatable mock key ranges from that seed; all policies receive the same flush
 count.
+
+## Benchmarks
+
+Phase 1 of the [production roadmap](production-roadmap.md) starts with a
+`db_bench`-style binary. Prefer a Release build:
+
+```sh
+cmake --preset release
+cmake --build --preset release
+./build/release/apps/hermesdb_bench --workload fillrandom --num 50000 --json
+```
+
+Workloads: `fillseq`, `fillrandom`, `overwrite`, `readrandom`, `readseq`,
+`readwhilewriting`, `scan`, `deleterandom`, and YCSB `ycsb-a` through `ycsb-f`.
+YCSB run phases load `--num` keys first, then execute `--ops` operations with
+`--distribution uniform|zipfian|latest`.
+
+`--json` prints one object with:
+
+- throughput and p50 / p95 / p99 / p99.9 latency
+- engine counters (`DB::Metrics`): user bytes, WAL bytes, flush and
+  compaction bytes, L0/L1 file counts
+- derived write and space amplification
+- commit, compiler, kernel, CPU, and memory fields
+
+`--threads 0` uses `std::thread::hardware_concurrency()`. `--seconds N` runs
+until wall time elapses instead of `--ops`. Block-cache and `io_uring` fields
+are explicitly `null` until those subsystems exist.
+
+A tiny smoke run is registered as `hermesdb_bench_smoke`. Do not treat Debug
+smoke throughput as a performance baseline.

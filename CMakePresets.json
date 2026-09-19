@@ -14,7 +14,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "TINY_LSM_BUILD_TESTS": "ON"
+        "HERMESDB_BUILD_TESTS": "ON"
       }
     },
     {
@@ -32,7 +32,7 @@
       "inherits": "default",
       "binaryDir": "${sourceDir}/build/asan-ubsan",
       "cacheVariables": {
-        "TINY_LSM_SANITIZER": "address-undefined"
+        "HERMESDB_SANITIZER": "address-undefined"
       }
     },
     {
@@ -41,7 +41,7 @@
       "inherits": "default",
       "binaryDir": "${sourceDir}/build/tsan",
       "cacheVariables": {
-        "TINY_LSM_SANITIZER": "thread"
+        "HERMESDB_SANITIZER": "thread"
       }
     }
   ],

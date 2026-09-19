@@ -1,5 +1,5 @@
-#include "tiny_lsm/compaction.hpp"
-#include "tiny_lsm/db.hpp"
+#include "hermesdb/compaction.hpp"
+#include "hermesdb/db.hpp"
 
 #include <charconv>
 #include <cctype>
@@ -65,15 +65,15 @@ Options parse_args(int argc, char** argv) {
   return options;
 }
 
-tiny_lsm::CompactionOptions compaction_options(std::string_view policy) {
+hermesdb::CompactionOptions compaction_options(std::string_view policy) {
   if (policy == "simple") {
-    return tiny_lsm::SimpleLeveledCompactionOptions{
+    return hermesdb::SimpleLeveledCompactionOptions{
         .size_ratio_percent = 200,
         .level0_file_num_compaction_trigger = 2,
         .max_levels = 4};
   }
   if (policy == "tiered") {
-    return tiny_lsm::TieredCompactionOptions{
+    return hermesdb::TieredCompactionOptions{
         .num_tiers = 3,
         .max_size_amplification_percent = 200,
         .size_ratio = 1,
@@ -81,13 +81,13 @@ tiny_lsm::CompactionOptions compaction_options(std::string_view policy) {
         .max_merge_width = std::nullopt};
   }
   if (policy == "leveled") {
-    return tiny_lsm::LeveledCompactionOptions{
+    return hermesdb::LeveledCompactionOptions{
         .level_size_multiplier = 2,
         .level0_file_num_compaction_trigger = 2,
         .max_levels = 4,
         .base_level_size_mb = 128};
   }
-  return tiny_lsm::NoCompactionOptions{};
+  return hermesdb::NoCompactionOptions{};
 }
 
 std::uint64_t parse_u64(std::string_view text, std::string_view name) {
@@ -99,7 +99,7 @@ std::uint64_t parse_u64(std::string_view text, std::string_view name) {
   return value;
 }
 
-std::string printable(tiny_lsm::ByteView bytes) {
+std::string printable(hermesdb::ByteView bytes) {
   std::string output;
   for (const auto byte : bytes) {
     const auto character = static_cast<unsigned char>(byte);
@@ -130,7 +130,7 @@ void print_help() {
 }
 
 bool execute(const std::vector<std::string>& words,
-             const std::shared_ptr<tiny_lsm::MiniLsm>& db,
+             const std::shared_ptr<hermesdb::DB>& db,
              std::uint64_t& epoch) {
   if (words.empty()) {
     return true;
@@ -177,8 +177,8 @@ bool execute(const std::vector<std::string>& words,
     auto iterator =
         words.size() == 1
             ? db->Scan()
-            : db->Scan(tiny_lsm::KeyBound::Included(words[1]),
-                       tiny_lsm::KeyBound::Included(words[2]));
+            : db->Scan(hermesdb::KeyBound::Included(words[1]),
+                       hermesdb::KeyBound::Included(words[2]));
     std::size_t count{};
     while (iterator.valid()) {
       std::cout << printable(iterator.key()) << '=' << printable(iterator.value())
@@ -226,23 +226,23 @@ bool execute(const std::vector<std::string>& words,
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::shared_ptr<tiny_lsm::MiniLsm> db;
+  std::shared_ptr<hermesdb::DB> db;
   try {
     const auto arguments = parse_args(argc, argv);
-    tiny_lsm::LsmStorageOptions options;
+    hermesdb::Options options;
     options.block_size = 4096;
     options.target_sst_size = 2U << 20U;
     options.num_memtable_limit = 3;
     options.compaction_options = compaction_options(arguments.compaction);
     options.enable_wal = arguments.enable_wal;
     options.serializable = arguments.serializable;
-    db = tiny_lsm::MiniLsm::Open(arguments.path, std::move(options));
+    db = hermesdb::DB::Open(arguments.path, std::move(options));
 
-    std::cout << "tiny-lsm CLI (" << arguments.path.string() << ")\n";
+    std::cout << "hermesdb CLI (" << arguments.path.string() << ")\n";
     print_help();
     std::uint64_t epoch{};
     std::string line;
-    while (std::cout << "tiny-lsm> " && std::getline(std::cin, line)) {
+    while (std::cout << "hermesdb> " && std::getline(std::cin, line)) {
       std::istringstream input(line);
       std::vector<std::string> words;
       for (std::string word; input >> word;) {

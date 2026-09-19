@@ -1,25 +1,26 @@
-#include "tiny_lsm/table.hpp"
+#include "hermesdb/table.hpp"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 
-namespace tiny_lsm {
+namespace hermesdb {
 namespace {
 
-void encode_key(Bytes& out, ByteView key) {
-  put_u16(out, narrow_size<std::uint16_t>(key.size(), "metadata key"));
-  out.insert(out.end(), key.begin(), key.end());
+void encode_key(Bytes& out, const InternalKey& key) {
+  const Bytes encoded = key.encode();
+  put_u16(out, narrow_size<std::uint16_t>(encoded.size(), "metadata key"));
+  out.insert(out.end(), encoded.begin(), encoded.end());
 }
 
-Bytes decode_key(ByteView bytes, std::size_t& cursor, std::size_t limit) {
+InternalKey decode_key(ByteView bytes, std::size_t& cursor,
+                       std::size_t limit) {
   const auto size = read_u16(bytes, cursor);
   cursor += 2;
   if (cursor + size > limit) throw Error("truncated table metadata key");
-  Bytes key(bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
-            bytes.begin() + static_cast<std::ptrdiff_t>(cursor + size));
+  const auto result = InternalKey::decode(bytes.subspan(cursor, size));
   cursor += size;
-  return key;
+  return result;
 }
 
 }  // namespace
@@ -30,9 +31,10 @@ BloomFilter BloomFilter::Build(std::span<const std::uint32_t> key_hashes,
       std::max<std::size_t>(64, key_hashes.size() * bits_per_key);
   bit_count = (bit_count + 7U) & ~std::size_t{7};
   Bytes bits(bit_count / 8U, 0);
-  const auto hash_count = static_cast<std::uint8_t>(std::clamp<std::size_t>(
-      static_cast<std::size_t>(static_cast<double>(bits_per_key) * 0.69), 1,
-      30));
+  const auto hash_count = static_cast<std::uint8_t>(
+      std::clamp<std::size_t>(
+          static_cast<std::size_t>(static_cast<double>(bits_per_key) * 0.69),
+          1, 30));
   for (auto hash : key_hashes) {
     const auto delta = std::rotl(hash, 15);
     for (std::uint8_t round = 0; round < hash_count; ++round) {
@@ -173,7 +175,7 @@ std::shared_ptr<Table> Table::open(Bytes encoded) {
     item.last_key = decode_key(encoded, cursor, metadata_end);
     if (item.offset >= meta_offset ||
         (!meta.empty() && item.offset <= meta.back().offset) ||
-        bytes_less(item.last_key, item.first_key)) {
+        item.last_key < item.first_key) {
       throw Error("invalid table block metadata");
     }
     meta.push_back(std::move(item));
@@ -181,24 +183,13 @@ std::shared_ptr<Table> Table::open(Bytes encoded) {
   if (cursor != metadata_end || meta.empty() || meta.front().offset != 0) {
     throw Error("invalid table metadata");
   }
-  return std::shared_ptr<Table>(new Table(std::move(encoded), std::move(meta),
-                                          meta_offset, std::move(bloom)));
+  return std::shared_ptr<Table>(
+      new Table(std::move(encoded), std::move(meta), meta_offset,
+                std::move(bloom)));
 }
-
-ByteView Table::first_key() const noexcept { return meta_.front().first_key; }
-
-ByteView Table::last_key() const noexcept { return meta_.back().last_key; }
 
 bool Table::may_contain(ByteView user_key) const noexcept {
   return bloom_.MayContain(checksum(user_key));
-}
-
-std::optional<Bytes> Table::get(ByteView key) const {
-  auto iterator = iter_from(key);
-  if (!iterator->valid() || !bytes_equal(iterator->key(), key)) {
-    return std::nullopt;
-  }
-  return Bytes(iterator->value().begin(), iterator->value().end());
 }
 
 std::shared_ptr<const Block> Table::read_block(std::size_t index) const {
@@ -222,26 +213,66 @@ std::shared_ptr<const Block> Table::read_block_cached(
   return block;
 }
 
-std::size_t Table::find_block(ByteView key) const {
+std::size_t Table::find_block(const InternalKey& key) const {
   const auto it = std::lower_bound(
       meta_.begin(), meta_.end(), key,
-      [](const BlockMeta& item, ByteView target) {
-        return bytes_less(item.last_key, target);
+      [](const BlockMeta& item, const InternalKey& target) {
+        return item.last_key < target;
       });
   return it == meta_.end() ? meta_.size() - 1
                            : static_cast<std::size_t>(it - meta_.begin());
 }
 
-IteratorPtr Table::iter() const {
-  auto iterator = std::make_unique<TableIterator>(shared_from_this());
-  iterator->seek_to_first();
-  return iterator;
+std::optional<Bytes> Table::get(ByteView user_key) const {
+  return get(user_key, kMaxTimestamp);
 }
 
-IteratorPtr Table::iter_from(ByteView key) const {
-  auto iterator = std::make_unique<TableIterator>(shared_from_this());
-  iterator->seek(key);
-  return iterator;
+std::optional<Bytes> Table::get(ByteView user_key,
+                                std::uint64_t read_timestamp) const {
+  if (bytes_less(user_key, meta_.front().first_key.user_key()) ||
+      bytes_less(meta_.back().last_key.user_key(), user_key) ||
+      !may_contain(user_key)) {
+    return std::nullopt;
+  }
+  const InternalKey target(Bytes(user_key.begin(), user_key.end()),
+                           read_timestamp);
+  const auto block_index = find_block(target);
+  BlockIterator iterator(read_block(block_index));
+  iterator.seek(target);
+  if (!iterator.valid() ||
+      !std::equal(iterator.key().user_key().begin(),
+                  iterator.key().user_key().end(), user_key.begin(),
+                  user_key.end()))
+    return std::nullopt;
+  return Bytes(iterator.value().begin(), iterator.value().end());
+}
+
+IteratorPtr Table::iter() const {
+  std::vector<KeyValue> entries;
+  for (std::size_t i = 0; i < meta_.size(); ++i) {
+    BlockIterator iterator(read_block(i));
+    while (iterator.valid()) {
+      entries.emplace_back(iterator.key(),
+                           Bytes(iterator.value().begin(), iterator.value().end()));
+      iterator.next();
+    }
+  }
+  return std::make_unique<VectorIterator>(std::move(entries));
+}
+
+IteratorPtr Table::iter_from(const InternalKey& key) const {
+  std::vector<KeyValue> entries;
+  const auto first_block = find_block(key);
+  for (std::size_t i = first_block; i < meta_.size(); ++i) {
+    BlockIterator iterator(read_block(i));
+    if (i == first_block) iterator.seek(key);
+    while (iterator.valid()) {
+      entries.emplace_back(iterator.key(),
+                           Bytes(iterator.value().begin(), iterator.value().end()));
+      iterator.next();
+    }
+  }
+  return std::make_unique<VectorIterator>(std::move(entries));
 }
 
 TableBuilder::TableBuilder(std::size_t block_size)
@@ -251,18 +282,18 @@ bool TableBuilder::empty() const noexcept {
   return meta_.empty() && block_.empty();
 }
 
-void TableBuilder::add(ByteView key, ByteView value) {
-  if (previous_key_ && !bytes_less(*previous_key_, key)) {
+void TableBuilder::add(const InternalKey& key, ByteView value) {
+  if (previous_key_ && !(previous_key_.value() < key)) {
     throw Error("table keys must be added in strictly increasing order");
   }
   if (!block_.add(key, value)) {
     finish_block();
     if (!block_.add(key, value)) throw Error("failed to add to empty block");
   }
-  if (!first_key_) first_key_ = Bytes(key.begin(), key.end());
-  last_key_ = Bytes(key.begin(), key.end());
-  previous_key_ = last_key_;
-  key_hashes_.push_back(checksum(key));
+  if (!first_key_) first_key_ = key;
+  last_key_ = key;
+  previous_key_ = key;
+  key_hashes_.push_back(checksum(key.user_key()));
 }
 
 void TableBuilder::finish_block() {
@@ -301,116 +332,4 @@ Bytes TableBuilder::finish() {
   return std::move(data_);
 }
 
-TableIterator::TableIterator(std::shared_ptr<const Table> table)
-    : table_(std::move(table)) {}
-
-bool TableIterator::valid() const noexcept {
-  return block_iter_ && block_iter_->valid();
-}
-
-ByteView TableIterator::key() const {
-  if (!valid()) throw Error("iterator is invalid");
-  return block_iter_->key();
-}
-
-ByteView TableIterator::value() const {
-  if (!valid()) throw Error("iterator is invalid");
-  return block_iter_->value();
-}
-
-void TableIterator::next() {
-  if (!valid()) return;
-  block_iter_->next();
-  if (!block_iter_->valid()) {
-    open_block(block_index_ + 1, nullptr);
-  }
-}
-
-void TableIterator::seek_to_first() { open_block(0, nullptr); }
-
-void TableIterator::seek(ByteView target) {
-  if (!table_ || table_->num_blocks() == 0) {
-    block_iter_.reset();
-    return;
-  }
-  const auto index = table_->find_block(target);
-  open_block(index, &target);
-  if (!valid() && index + 1 < table_->num_blocks()) {
-    open_block(index + 1, nullptr);
-  }
-}
-
-void TableIterator::open_block(std::size_t index, const ByteView* target) {
-  if (!table_ || index >= table_->num_blocks()) {
-    block_iter_.reset();
-    return;
-  }
-  block_index_ = index;
-  block_iter_ = std::make_unique<BlockIterator>(table_->read_block(index));
-  if (target != nullptr) {
-    block_iter_->seek(*target);
-  }
-}
-
-ConcatIterator::ConcatIterator(std::vector<std::shared_ptr<const Table>> tables)
-    : tables_(std::move(tables)) {}
-
-bool ConcatIterator::valid() const noexcept {
-  return child_ && child_->valid();
-}
-
-ByteView ConcatIterator::key() const {
-  if (!valid()) throw Error("iterator is invalid");
-  return child_->key();
-}
-
-ByteView ConcatIterator::value() const {
-  if (!valid()) throw Error("iterator is invalid");
-  return child_->value();
-}
-
-void ConcatIterator::next() {
-  if (!valid()) return;
-  child_->next();
-  if (!child_->valid()) {
-    open_table(index_ + 1, nullptr);
-  }
-}
-
-void ConcatIterator::seek_to_first() { open_table(0, nullptr); }
-
-void ConcatIterator::seek(ByteView target) {
-  if (tables_.empty()) {
-    child_.reset();
-    return;
-  }
-  const auto it = std::lower_bound(
-      tables_.begin(), tables_.end(), target,
-      [](const std::shared_ptr<const Table>& table, ByteView wanted) {
-        return bytes_less(table->last_key(), wanted);
-      });
-  if (it == tables_.end()) {
-    child_.reset();
-    return;
-  }
-  open_table(static_cast<std::size_t>(it - tables_.begin()), &target);
-}
-
-void ConcatIterator::open_table(std::size_t index, const ByteView* target) {
-  if (index >= tables_.size() || !tables_[index]) {
-    child_.reset();
-    return;
-  }
-  index_ = index;
-  child_ = std::make_unique<TableIterator>(tables_[index]);
-  if (target != nullptr) {
-    child_->seek(*target);
-  } else {
-    child_->seek_to_first();
-  }
-  if (!child_->valid() && index + 1 < tables_.size()) {
-    open_table(index + 1, nullptr);
-  }
-}
-
-}  // namespace tiny_lsm
+}  // namespace hermesdb

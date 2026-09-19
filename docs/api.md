@@ -1,16 +1,18 @@
 # API guide
 
-The public API is in namespace `tiny_lsm`. Include `tiny_lsm/db.hpp` for the
-database and `tiny_lsm/transaction.hpp` when calling transaction methods.
+The C++ API lives in namespace `hermesdb`. Include `hermesdb/db.hpp` for the
+database and `hermesdb/transaction.hpp` when calling transaction methods.
+`#include <hermesdb/hermesdb.hpp>` pulls in that public surface. The C API is
+`#include <hermesdb.h>` and is intended for other languages via FFI.
 
 ## Opening and closing
 
-`MiniLsm::Open(path, options)` creates or recovers a database directory and
-returns `std::shared_ptr<MiniLsm>`. `Close()` finishes database shutdown.
+`DB::Open(path, options)` creates or recovers a database directory and
+returns `std::shared_ptr<DB>`. `Close()` finishes database shutdown.
 `Sync()` requests durable synchronization of active persistence components.
 Close handles before deleting or moving their database directory.
 
-The important `LsmStorageOptions` fields are:
+The important `Options` fields are:
 
 - `block_size`: target uncompressed block size, in bytes.
 - `target_sst_size`: approximate SST and memtable size target, in bytes.
@@ -46,8 +48,8 @@ or excluded:
 
 ```cpp
 auto iterator = db->Scan(
-    tiny_lsm::KeyBound::Included("account/100"),
-    tiny_lsm::KeyBound::Excluded("account/200"));
+    hermesdb::KeyBound::Included("account/100"),
+    hermesdb::KeyBound::Excluded("account/200"));
 
 while (iterator.valid()) {
   consume(iterator.key(), iterator.value());
@@ -79,7 +81,16 @@ versions from being reclaimed.
 Forced maintenance is useful in tests and demonstrations. Normal applications
 should generally allow background flush and compaction decisions to operate.
 
-Errors are reported as exceptions, including `tiny_lsm::Error` for common
+Errors are reported as exceptions, including `hermesdb::Error` for common
 format and validation failures. Treat a failed write, flush, sync, commit, or
 close as an operation that did not establish the durability guarantee the
 caller requested.
+
+## C API
+
+`#include <hermesdb.h>` is a C ABI over the same engine. Open with
+`hermesdb_open`, then `hermesdb_put`, `hermesdb_get`, `hermesdb_delete`, and
+`hermesdb_sync`. `hermesdb_get` returns a malloc'd buffer (NUL-terminated for
+convenience; `*value_len` is the exact byte length) or `NULL` if the key is
+absent. Free that buffer and any `err` string with `hermesdb_free`.
+`hermesdb_close` shuts the database down.

@@ -1,9 +1,9 @@
-#include "tiny_lsm/common.hpp"
+#include "hermesdb/common.hpp"
 
 #include <algorithm>
 #include <cstring>
 
-namespace tiny_lsm {
+namespace hermesdb {
 
 ByteView as_bytes(std::string_view value) noexcept {
   return {reinterpret_cast<const Byte*>(value.data()), value.size()};
@@ -97,4 +97,4 @@ std::uint32_t checksum(ByteView data) noexcept {
   return ~crc;
 }
 
-}  // namespace tiny_lsm
+}  // namespace hermesdb

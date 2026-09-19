@@ -1,10 +1,10 @@
-// Educational compaction-policy simulator for tiny-lsm.
+// Educational compaction-policy simulator for hermesdb.
 //
 // This models file placement and amplification, not SST contents. It is useful
 // for comparing policy behavior without creating a database.
 
-#if __has_include("tiny_lsm/compaction.hpp")
-#include "tiny_lsm/compaction.hpp"
+#if __has_include("hermesdb/compaction.hpp")
+#include "hermesdb/compaction.hpp"
 #endif
 
 #include <algorithm>

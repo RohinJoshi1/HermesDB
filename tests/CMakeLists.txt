@@ -4,120 +4,60 @@ else()
   add_compile_options(-UNDEBUG)
 endif()
 
-add_executable(tiny_lsm_week1_day1_tests course/week1_day1_test.cpp)
-target_link_libraries(tiny_lsm_week1_day1_tests PRIVATE tiny_lsm::tiny_lsm)
-target_compile_features(tiny_lsm_week1_day1_tests PRIVATE cxx_std_20)
-
-if(TINY_LSM_ENABLE_WARNINGS)
-  if(MSVC)
-    target_compile_options(tiny_lsm_week1_day1_tests
-      PRIVATE /W4 /permissive-
-    )
-  else()
-    target_compile_options(tiny_lsm_week1_day1_tests
-      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
-    )
-  endif()
-endif()
-
-add_test(NAME tiny_lsm_week1_day1 COMMAND tiny_lsm_week1_day1_tests)
-set_tests_properties(tiny_lsm_week1_day1 PROPERTIES
-  LABELS "course;week1;week1-day1"
-)
-
-add_executable(tiny_lsm_week1_day2_tests course/week1_day2_test.cpp)
-target_link_libraries(tiny_lsm_week1_day2_tests PRIVATE tiny_lsm::tiny_lsm)
-target_compile_features(tiny_lsm_week1_day2_tests PRIVATE cxx_std_20)
-
-if(TINY_LSM_ENABLE_WARNINGS)
-  if(MSVC)
-    target_compile_options(tiny_lsm_week1_day2_tests
-      PRIVATE /W4 /permissive-
-    )
-  else()
-    target_compile_options(tiny_lsm_week1_day2_tests
-      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
-    )
-  endif()
-endif()
-
-add_test(NAME tiny_lsm_week1_day2 COMMAND tiny_lsm_week1_day2_tests)
-set_tests_properties(tiny_lsm_week1_day2 PROPERTIES
-  LABELS "course;week1;week1-day2"
-)
-
-add_executable(tiny_lsm_week1_day3_tests course/week1_day3_test.cpp)
-target_link_libraries(tiny_lsm_week1_day3_tests PRIVATE tiny_lsm::tiny_lsm)
-target_compile_features(tiny_lsm_week1_day3_tests PRIVATE cxx_std_20)
-
-if(TINY_LSM_ENABLE_WARNINGS)
-  if(MSVC)
-    target_compile_options(tiny_lsm_week1_day3_tests
-      PRIVATE /W4 /permissive-
-    )
-  else()
-    target_compile_options(tiny_lsm_week1_day3_tests
-      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
-    )
-  endif()
-endif()
-
-add_test(NAME tiny_lsm_week1_day3 COMMAND tiny_lsm_week1_day3_tests)
-set_tests_properties(tiny_lsm_week1_day3 PROPERTIES
-  LABELS "course;week1;week1-day3"
-)
-
-function(tiny_lsm_add_week1_test day)
-  add_executable(tiny_lsm_week1_day${day}_tests course/week1_day${day}_test.cpp)
-  target_link_libraries(tiny_lsm_week1_day${day}_tests PRIVATE tiny_lsm::tiny_lsm)
-  target_compile_features(tiny_lsm_week1_day${day}_tests PRIVATE cxx_std_20)
-  if(TINY_LSM_ENABLE_WARNINGS)
+function(hermesdb_add_test name)
+  add_executable(hermesdb_${name}_tests ${name}_test.cpp)
+  target_link_libraries(hermesdb_${name}_tests PRIVATE hermesdb::hermesdb)
+  target_compile_features(hermesdb_${name}_tests PRIVATE cxx_std_20)
+  if(HERMESDB_ENABLE_WARNINGS)
     if(MSVC)
-      target_compile_options(tiny_lsm_week1_day${day}_tests
-        PRIVATE /W4 /permissive-
-      )
+      target_compile_options(hermesdb_${name}_tests PRIVATE /W4 /permissive-)
     else()
-      target_compile_options(tiny_lsm_week1_day${day}_tests
-        PRIVATE -Wall -Wextra -Wpedantic -Wconversion
-      )
+      target_compile_options(hermesdb_${name}_tests
+        PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     endif()
   endif()
-  add_test(NAME tiny_lsm_week1_day${day} COMMAND tiny_lsm_week1_day${day}_tests)
-  set_tests_properties(tiny_lsm_week1_day${day} PROPERTIES
-    LABELS "course;week1;week1-day${day}"
-  )
+  add_test(NAME hermesdb_${name} COMMAND hermesdb_${name}_tests)
+  set_tests_properties(hermesdb_${name} PROPERTIES LABELS "${name}")
 endfunction()
 
-tiny_lsm_add_week1_test(4)
-tiny_lsm_add_week1_test(5)
-tiny_lsm_add_week1_test(6)
-tiny_lsm_add_week1_test(7)
-set_tests_properties(tiny_lsm_week1_day7 PROPERTIES
-  LABELS "course;week1;week1-day7"
-)
+hermesdb_add_test(memtable)
+hermesdb_add_test(iterator)
+hermesdb_add_test(block)
+hermesdb_add_test(table)
+hermesdb_add_test(read_path)
+hermesdb_add_test(flush)
+hermesdb_add_test(bloom)
+hermesdb_add_test(compaction)
+hermesdb_add_test(simple_leveled)
+hermesdb_add_test(tiered)
+hermesdb_add_test(leveled)
+hermesdb_add_test(manifest)
+hermesdb_add_test(wal)
+hermesdb_add_test(recovery)
+hermesdb_add_test(timestamp)
+hermesdb_add_test(mvcc_compaction)
+hermesdb_add_test(snapshot)
+hermesdb_add_test(watermark)
+hermesdb_add_test(transaction)
+hermesdb_add_test(serializable)
+hermesdb_add_test(compaction_filter)
+hermesdb_add_test(capi)
 
-function(tiny_lsm_add_week2_test day)
-  add_executable(tiny_lsm_week2_day${day}_tests course/week2_day${day}_test.cpp)
-  target_link_libraries(tiny_lsm_week2_day${day}_tests PRIVATE tiny_lsm::tiny_lsm)
-  target_compile_features(tiny_lsm_week2_day${day}_tests PRIVATE cxx_std_20)
-  if(TINY_LSM_ENABLE_WARNINGS)
+function(hermesdb_add_extra_test name source)
+  add_executable(hermesdb_${name}_tests ${source})
+  target_link_libraries(hermesdb_${name}_tests PRIVATE hermesdb::hermesdb)
+  target_compile_features(hermesdb_${name}_tests PRIVATE cxx_std_20)
+  if(HERMESDB_ENABLE_WARNINGS)
     if(MSVC)
-      target_compile_options(tiny_lsm_week2_day${day}_tests
-        PRIVATE /W4 /permissive-
-      )
+      target_compile_options(hermesdb_${name}_tests PRIVATE /W4 /permissive-)
     else()
-      target_compile_options(tiny_lsm_week2_day${day}_tests
-        PRIVATE -Wall -Wextra -Wpedantic -Wconversion
-      )
+      target_compile_options(hermesdb_${name}_tests
+        PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     endif()
   endif()
-  add_test(NAME tiny_lsm_week2_day${day} COMMAND tiny_lsm_week2_day${day}_tests)
-  set_tests_properties(tiny_lsm_week2_day${day} PROPERTIES
-    LABELS "course;week2;week2-day${day}"
-  )
+  add_test(NAME hermesdb_${name} COMMAND hermesdb_${name}_tests)
+  set_tests_properties(hermesdb_${name} PROPERTIES LABELS "mvcc")
 endfunction()
 
-tiny_lsm_add_week2_test(1)
-set_tests_properties(tiny_lsm_week2_day1 PROPERTIES
-  LABELS "course;week2;week2-day1;current"
-)
+hermesdb_add_extra_test(mvcc mvcc/mvcc_test.cpp)
+hermesdb_add_extra_test(mvcc_extended mvcc/mvcc_extended_test.cpp)

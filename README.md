@@ -1,162 +1,108 @@
-# tiny-lsm course starter
+# HermesDB
 
-`tiny-lsm` is a C++20 course port of
-[Mini-LSM](https://github.com/skyzh/mini-lsm). This branch is deliberately
-incomplete: it is the starter scaffold, not a working storage engine.
+HermesDB is an embedded LSM-tree storage engine in C++20. Open a directory,
+then `Put` / `Get` / `Delete` / `Scan` from the same process. It is derived
+from [Mini-LSM](https://github.com/skyzh/mini-lsm) and adds MVCC snapshots,
+WAL recovery, and multiple compaction policies.
 
-## Branches
+## Use it from another project
 
-- `course` is the exercise branch. It contains explicit chapter-labeled TODOs.
-- `solution-checkpoints` preserves completed solutions for reference or
-  instructor use.
+### CMake `find_package`
 
-Completed checkpoint tags belong to the preserved solution history; they are
-not the workflow for starting an exercise.
-
-## Accelerated course cadence
-
-We complete two original course chapters per workday. This produces a working
-LSM database after four accelerated days and completes the full persistence
-and MVCC course in eleven accelerated days. Compressing all 21 chapters into
-seven days would require three chapters—and roughly six to nine focused
-hours—every day.
-
-The accelerated schedule is:
-
-1. Week 1 Days 1–2: memtable, database state, merge iterators, and range scans.
-2. Week 1 Days 3–4: block encoding and SST encoding.
-3. Week 1 Days 5–6: unified reads, writes, freezing, and flushing.
-4. Week 1 Day 7 + Week 2 Day 1: filters/prefix encoding and basic compaction.
-5. Week 2 Days 2–3: simple leveled and tiered/universal compaction.
-6. Week 2 Days 4–5: leveled compaction and the manifest.
-7. Week 2 Days 6–7: WAL/recovery and Week 2 refinements.
-8. Week 3 Days 1–2: timestamped keys, memtables, writes, and compaction.
-9. Week 3 Days 3–4: transaction snapshots, watermarks, and garbage collection.
-10. Week 3 Days 5–6: transaction workspaces, atomic commits, and validation.
-11. Week 3 Day 7: compaction filters, integration tests, and final review.
-
-Days 1–7 of Week 1 are complete. The current workday is **Week 2 Days 1–2**:
-full compaction to L1, a background flush thread, then simple leveled
-compaction.
-
-For each accelerated workday:
-
-1. Read both chapters, but implement and test them sequentially.
-2. Preserve the checkpoint invariants and tests for each individual chapter.
-3. Configure and build:
-
-   ```sh
-   cmake --preset default
-   cmake --build --preset default
-   ```
-
-4. Run the current and all prior exercise tests:
-
-   ```sh
-   ctest --preset default --output-on-failure
-   ```
-
-An active exercise test is expected to fail until its TODOs are implemented.
-Do not remove or weaken tests to make a checkpoint pass.
-
-To list all current and future course work:
+Install the library, then link `hermesdb::hermesdb`:
 
 ```sh
-rg 'TODO\(' include src
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix /usr/local
 ```
 
-## Starter scope
+```cmake
+find_package(HermesDB REQUIRED)
+target_link_libraries(app PRIVATE hermesdb::hermesdb)
+```
 
-The active build contains memtables, merge iterators, prefix-encoded blocks,
-SSTs with Bloom filters and a block cache, a unified read path, and memtable
-flushing into overlapping L0 files. Later chapters—compaction, persistence,
-and MVCC transactions—remain declarations or explicit source skeletons.
+```cpp
+#include <hermesdb/db.hpp>
 
-Requirements: CMake 3.21 or newer, Ninja, and a compiler with C++20 support.
-The library target is `tiny_lsm::tiny_lsm`; public headers are under
-`include/tiny_lsm`.
+auto db = hermesdb::DB::Open("my.db");
+db->Put("key", "value");
+auto value = db->Get("key");
+```
 
-## Production and performance track
+### CMake FetchContent
 
-After the course, the project targets a narrower production-inspired role:
+```cmake
+include(FetchContent)
+FetchContent_Declare(hermesdb
+  GIT_REPOSITORY https://github.com/your-org/hermesdb.git
+  GIT_TAG v0.1.0)
+set(HERMESDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(HERMESDB_BUILD_APPS OFF CACHE BOOL "" FORCE)
+set(HERMESDB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(hermesdb)
+target_link_libraries(app PRIVATE hermesdb::hermesdb)
+```
 
-> A modern C++ embedded LSM storage engine focused on predictable tail latency,
-> workload-aware compaction, and asynchronous NVMe I/O.
+### C API (FFI)
 
-The [production roadmap](docs/production-roadmap.md) converts recent PVLDB
-research into measurable phases: crash safety and benchmarks first, followed
-by lazy reads, sustainable write admission, adaptive compaction, a portable
-I/O abstraction with an `io_uring` backend, SSD-aware layout, and multicore
-optimization. The roadmap deliberately keeps experimental learned policies
-behind deterministic baselines and safety controls.
+C, Python ctypes, and other languages can call the same engine:
+
+```c
+#include <hermesdb.h>
+
+hermesdb_options_t options;
+hermesdb_options_init(&options);
+options.enable_wal = 1;
+
+char* err = NULL;
+hermesdb_t* db = hermesdb_open("my.db", &options, &err);
+hermesdb_put(db, "key", 3, "value", 5, &err);
+size_t n = 0;
+char* value = hermesdb_get(db, "key", 3, &n, &err);
+hermesdb_free(value);
+hermesdb_close(db);
+```
+
+Error strings and `hermesdb_get` buffers are heap-allocated; free them with
+`hermesdb_free`. Missing keys return `NULL` without setting `err`.
+
+## Build this repository
+
+Requires CMake 3.21+, Ninja, and a C++20 compiler.
+
+```sh
+cmake --preset default
+cmake --build --preset default
+ctest --preset default --output-on-failure
+```
+
+Examples: `./build/debug/examples/hermesdb_hello_cpp` and
+`hermesdb_hello_c`. Benchmarks and the REPL: see [docs/tools.md](docs/tools.md).
+API details: [docs/api.md](docs/api.md).
 
 ## Architecture
 
-The completed engine follows the standard LSM-tree split between a fast
-in-memory write path, immutable on-disk files, and a merged read path:
-
 ```mermaid
 flowchart LR
-  Client[Client API] --> DB[MiniLsm]
-
+  Client[Client API] --> DB[DB]
   DB -->|"Put / Delete"| WAL[Write-ahead log]
   WAL --> Mutable[Mutable memtable]
   Mutable -->|Freeze| Immutable[Immutable memtables]
   Immutable -->|Flush| L0[Overlapping L0 SSTs]
   L0 -->|Compaction| Levels[Non-overlapping levels]
-
   DB -->|"Get / Scan"| ReadPath[Read path]
   Mutable --> ReadPath
   Immutable --> ReadPath
   L0 --> ReadPath
   Levels --> ReadPath
-  ReadPath --> Merge[Merge iterators]
-  Merge --> Visible[Newest visible value]
-
-  Manifest[Manifest] -. tracks .-> L0
-  Manifest -. tracks .-> Levels
 ```
 
-### Write path
+Writes land in a memtable (and optionally a WAL). Flushes produce SST files.
+Gets search newest-first: memtables, then L0, then lower levels. Internal keys
+are `(user key, timestamp)` so snapshots can read a consistent version.
 
-1. `Put` and `Delete` enter the mutable memtable; deletion is stored as an
-   empty-value tombstone.
-2. When the memtable reaches its target size, it becomes immutable and a new
-   mutable memtable accepts writes.
-3. Immutable memtables are flushed into immutable SST files in L0.
-4. Background compaction merges SSTs into sorted, non-overlapping levels and
-   eventually removes obsolete values and tombstones.
-5. The WAL protects unflushed writes, while the manifest records durable
-   changes to the SST layout.
+## License
 
-### Read path
-
-Point reads and scans examine sources from newest to oldest: mutable memtable,
-immutable memtables, L0 SSTs, then lower levels. Every source is sorted, so
-merge iterators produce one ordered stream. Duplicate keys are resolved before
-tombstones are hidden; otherwise an older deleted value could be resurrected.
-
-### MVCC layer
-
-Week 3 extends internal keys with a timestamp. Versions sort by user key and
-then descending timestamp. Transactions read from a stable timestamp,
-watermarks protect versions needed by active readers, and compaction reclaims
-only versions that can no longer be observed.
-
-### Source layout
-
-- `src/memtable/`: ordered in-memory writes and tombstones.
-- `src/iterators/`: cursor, merge, and range iteration.
-- `src/block/`: block encoding, decoding, seeking, and prefix compression.
-- `src/table/`: SST construction, metadata, checksums, Bloom filters, and cache.
-- `src/storage/`: public database API and read/write orchestration.
-- `src/compaction/`: simple-leveled, leveled, and tiered policies.
-- `src/persistence/`: WAL and manifest formats and recovery.
-
-## Upstream and licensing
-
-This work is derived from Mini-LSM by Alex Chi Z, pinned to upstream commit
-[`1d658ff`](https://github.com/skyzh/mini-lsm/tree/1d658ff). Mini-LSM starter
-and solution code is licensed under the Apache License 2.0. Upstream copyright
-and license details are in `docs/upstream.md`; repository licensing terms are
-in `LICENSE`.
+MIT for this repository (`LICENSE`). Mini-LSM attribution is in
+`docs/upstream.md`.

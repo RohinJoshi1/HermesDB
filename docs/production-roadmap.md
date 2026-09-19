@@ -1,7 +1,7 @@
 # Production and Performance Track
 
-This track begins after the three-week Mini-LSM course is complete. The course
-teaches storage-engine invariants; this track turns the result into a
+This track starts from a working embedded LSM. The course
+teaches storage-engine invariants; this document turns that engine into a
 production-inspired experimental engine for modern NVMe devices.
 
 ## Positioning
