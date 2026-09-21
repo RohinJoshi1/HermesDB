@@ -36,6 +36,8 @@ void put_u64(Bytes& out, std::uint64_t value);
 [[nodiscard]] std::size_t common_prefix(ByteView lhs, ByteView rhs) noexcept;
 [[nodiscard]] std::uint32_t checksum(ByteView data) noexcept;
 
+enum class Compression { none, zlib };
+
 template <typename T>
 [[nodiscard]] T narrow_size(std::size_t value, std::string_view what) {
   if (value > static_cast<std::size_t>(std::numeric_limits<T>::max())) {

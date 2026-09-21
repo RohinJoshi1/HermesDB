@@ -44,6 +44,8 @@ struct Options {
   std::size_t target_sst_size{2U << 20U};
   std::size_t num_memtable_limit{3};
   CompactionOptions compaction_options{LeveledCompactionOptions{}};
+  Compression compression{Compression::none};
+  std::size_t block_cache_capacity{4096};
   bool enable_wal{false};
   bool serializable{false};
 };
@@ -64,6 +66,10 @@ struct DbMetrics {
   std::uint64_t compaction_count{};
   std::uint64_t compaction_input_bytes{};
   std::uint64_t compaction_output_bytes{};
+  std::uint64_t sst_raw_bytes{};
+  std::uint64_t sst_stored_bytes{};
+  std::uint64_t block_cache_hits{};
+  std::uint64_t block_cache_misses{};
   std::size_t immutable_memtables{};
   std::size_t l0_tables{};
   std::size_t l1_tables{};

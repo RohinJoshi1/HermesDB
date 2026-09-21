@@ -44,6 +44,11 @@ int main() {
   assert(as_string(*db->Get("a")) == "new-a");
   assert(!db->Get("b"));  // newer L0 tombstone hides the older L0 value
   assert(as_string(*db->Get("c")) == "new-c");
+  const auto m1 = db->Metrics();
+  assert(as_string(*db->Get("a")) == "new-a");
+  const auto m2 = db->Metrics();
+  assert(m2.block_cache_hits > m1.block_cache_hits);
+  assert(m1.block_cache_misses > 0);
 
   const auto structure = db->DumpStructure();
   assert(structure.find("immutable_memtables=0") != std::string::npos);

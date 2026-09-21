@@ -79,28 +79,31 @@ ctest --preset default --output-on-failure
 
 Examples: `./build/debug/examples/hermesdb_hello_cpp` and
 `hermesdb_hello_c`. Benchmarks and the REPL: see [docs/tools.md](docs/tools.md).
-API details: [docs/api.md](docs/api.md).
+API details: [docs/api.md](docs/api.md). Internals:
+[docs/architecture.md](docs/architecture.md).
 
 ## Architecture
+
+Writes assign a timestamp with `fetch_add`, enqueue a WAL frame on an MPSC
+queue, and insert into a concurrent skip-list memtable. Get uses a closed
+timestamp prefix so snapshots do not see commit holes. Frozen memtables
+flush to L0 SSTs; compaction builds a non-overlapping L1. Optional zlib
+packs SST blocks toward 4 KiB pages. Get can see a key before its WAL group
+is `pwrite`d; `Sync` drains the log.
 
 ```mermaid
 flowchart LR
   Client[Client API] --> DB[DB]
-  DB -->|"Put / Delete"| WAL[Write-ahead log]
-  WAL --> Mutable[Mutable memtable]
-  Mutable -->|Freeze| Immutable[Immutable memtables]
-  Immutable -->|Flush| L0[Overlapping L0 SSTs]
-  L0 -->|Compaction| Levels[Non-overlapping levels]
-  DB -->|"Get / Scan"| ReadPath[Read path]
-  Mutable --> ReadPath
-  Immutable --> ReadPath
-  L0 --> ReadPath
-  Levels --> ReadPath
+  DB -->|"Put / Delete"| WAL[WAL MPSC then group pwrite]
+  DB --> Skip[Skip-list memtable]
+  Skip -->|Freeze| Imm[Immutable memtables]
+  Imm -->|Flush| L0[Overlapping L0 SSTs]
+  L0 -->|Compaction| L1[Non-overlapping L1]
+  DB -->|"Get / Scan"| Skip
+  Imm --> DB
+  L0 --> DB
+  L1 --> DB
 ```
-
-Writes land in a memtable (and optionally a WAL). Flushes produce SST files.
-Gets search newest-first: memtables, then L0, then lower levels. Internal keys
-are `(user key, timestamp)` so snapshots can read a consistent version.
 
 ## License
 

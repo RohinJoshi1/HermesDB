@@ -1,6 +1,7 @@
 #include "hermesdb/persistence.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -587,12 +588,28 @@ Bytes encode_mvcc_frame(std::span<const MvccWalRecord> records) {
 }  // namespace
 
 struct MvccWal::Impl {
-  explicit Impl(File file_arg) : file(std::move(file_arg)) {}
+  struct Node {
+    std::atomic<Node*> next{nullptr};
+    Bytes payload;
+  };
+
+  explicit Impl(File file_arg) : file(std::move(file_arg)) {
+    stub.next.store(nullptr, std::memory_order_relaxed);
+    head = &stub;
+    tail.store(&stub, std::memory_order_relaxed);
+  }
 
   ~Impl() {
     try {
       write_taken(take(0));
     } catch (...) {
+    }
+    Node* node = head;
+    if (node == &stub) node = stub.next.load(std::memory_order_relaxed);
+    while (node != nullptr && node != &stub) {
+      Node* next = node->next.load(std::memory_order_relaxed);
+      delete node;
+      node = next;
     }
   }
 
@@ -601,15 +618,32 @@ struct MvccWal::Impl {
 
   void enqueue(Bytes frame) {
     if (frame.empty()) return;
-    std::lock_guard lock(mutex);
-    buffer.insert(buffer.end(), frame.begin(), frame.end());
+    auto* node = new Node;
+    node->payload = std::move(frame);
+    const auto bytes = node->payload.size();
+    Node* prev = tail.exchange(node, std::memory_order_acq_rel);
+    prev->next.store(node, std::memory_order_release);
+    queued_bytes.fetch_add(bytes, std::memory_order_release);
   }
 
   Bytes take(std::size_t minimum) {
-    std::lock_guard lock(mutex);
-    if (buffer.size() < minimum) return {};
+    std::lock_guard lock(drain_mutex);
+    if (queued_bytes.load(std::memory_order_acquire) < minimum) return {};
     Bytes pending;
-    pending.swap(buffer);
+    Node* current = head;
+    Node* next = current->next.load(std::memory_order_acquire);
+    while (next != nullptr) {
+      pending.insert(pending.end(), next->payload.begin(), next->payload.end());
+      Node* old = current;
+      current = next;
+      next = current->next.load(std::memory_order_acquire);
+      if (old != &stub) delete old;
+    }
+    head = current;
+    const auto taken = pending.size();
+    if (taken != 0) {
+      queued_bytes.fetch_sub(taken, std::memory_order_acq_rel);
+    }
     return pending;
   }
 
@@ -618,8 +652,11 @@ struct MvccWal::Impl {
   }
 
   File file;
-  std::mutex mutex;
-  Bytes buffer;
+  Node stub;
+  Node* head{};
+  std::atomic<Node*> tail{nullptr};
+  std::atomic<std::size_t> queued_bytes{0};
+  std::mutex drain_mutex;
 };
 
 MvccWal::MvccWal(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}

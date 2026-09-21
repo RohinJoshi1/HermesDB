@@ -19,6 +19,10 @@ The important `Options` fields are:
 - `num_memtable_limit`: number of memory tables allowed before flush pressure.
 - `compaction_options`: one of the policy option structs below.
 - `enable_wal`: write new mutations to a write-ahead log.
+- `compression`: `Compression::none` (default) or `Compression::zlib` for
+  packed SST blocks.
+- `block_cache_capacity`: LRU data-block entries for `Get` (`0` disables;
+  default 4096).
 - `serializable`: enable serializable conflict validation for transactions.
 
 The compaction choice is a `CompactionOptions` variant:
@@ -39,7 +43,10 @@ tune file size, memory pressure, and compaction thresholds together.
 callers should use non-empty keys.
 
 `WriteBatch` accepts a span of `PutRecord` and `DeleteRecord` variants. A batch
-is the right interface when related writes must share one write operation.
+shares one timestamp. `Put` is visible to later `Get` on the same `DB` once
+the closed timestamp prefix includes that commit. Durability lags until a WAL
+group `pwrite` (64 KiB) or `Sync()`. Transaction `Commit` is serialized
+separately from plain `Put`.
 
 ## Scans
 

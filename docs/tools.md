@@ -94,15 +94,23 @@ YCSB run phases load `--num` keys first, then execute `--ops` operations with
 
 `--json` prints one object with:
 
-- throughput and p50 / p95 / p99 / p99.9 latency
+- throughput and p50 / p95 / p99 / p99.9 latency (power-of-two histogram
+  buckets: the percentile is the bucket **upper bound**, so p95 and p99 often
+  collapse)
 - engine counters (`DB::Metrics`): user bytes, WAL bytes, flush and
-  compaction bytes, L0/L1 file counts
-- derived write and space amplification
+  compaction bytes, SST raw vs stored bytes, L0/L1 file counts, block-cache
+  hits and misses
+- derived write, space, and block-compression ratios
 - commit, compiler, kernel, CPU, and memory fields
 
+YCSB-A is 50% Zipfian Get / 50% overwrite after a single-threaded load.
+YCSB-C is 100% Zipfian Get after the same load. Default Zipf θ is 0.99.
+`--threads` applies to the run phase only.
+
 `--threads 0` uses `std::thread::hardware_concurrency()`. `--seconds N` runs
-until wall time elapses instead of `--ops`. Block-cache and `io_uring` fields
-are explicitly `null` until those subsystems exist.
+until wall time elapses instead of `--ops`. `--compression none|zlib` selects
+packed SST block compression (`none` keeps the baseline format). `Get`
+uses `pread` plus the process block cache; `io_uring` fields remain `null`.
 
 A tiny smoke run is registered as `hermesdb_bench_smoke`. Do not treat Debug
 smoke throughput as a performance baseline.

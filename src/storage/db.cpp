@@ -11,8 +11,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -178,7 +176,8 @@ struct DB::Impl {
   std::mutex state_change_mutex;
   std::shared_ptr<const State> state;
   std::uint64_t next_memtable_id{1};
-  std::atomic<std::uint64_t> latest_timestamp{0};
+  std::atomic<std::uint64_t> next_timestamp{0};
+  std::atomic<std::uint64_t> visible_timestamp{0};
   std::mutex commit_mutex;
   mutable std::mutex readers_mutex;
   std::map<std::uint64_t, std::size_t> readers;
@@ -193,6 +192,7 @@ struct DB::Impl {
   std::thread flush_thread;
   std::unique_ptr<persistence::Manifest> manifest;
   std::vector<std::uint64_t> recovered_memtable_ids;
+  mutable std::unique_ptr<BlockCache> block_cache;
 
   struct Counters {
     std::atomic<std::uint64_t> write_ops{0};
@@ -208,11 +208,16 @@ struct DB::Impl {
     std::atomic<std::uint64_t> compaction_count{0};
     std::atomic<std::uint64_t> compaction_input_bytes{0};
     std::atomic<std::uint64_t> compaction_output_bytes{0};
+    std::atomic<std::uint64_t> sst_raw_bytes{0};
+    std::atomic<std::uint64_t> sst_stored_bytes{0};
   };
   mutable Counters counters;
 
   Impl(std::filesystem::path path_arg, Options options_arg)
       : path(std::move(path_arg)), options(std::move(options_arg)) {
+    if (options.block_cache_capacity > 0) {
+      block_cache = std::make_unique<BlockCache>(options.block_cache_capacity);
+    }
     auto initial = std::make_shared<State>();
     initial->mutable_memtable = {0, std::make_shared<MemTable>(), nullptr};
     state = std::move(initial);
@@ -243,7 +248,26 @@ struct DB::Impl {
 
   std::uint64_t watermark() const {
     std::lock_guard lock(readers_mutex);
-    return readers.empty() ? latest_timestamp.load() : readers.begin()->first;
+    return readers.empty() ? visible_timestamp.load() : readers.begin()->first;
+  }
+
+  void observe_timestamp(std::uint64_t timestamp) {
+    auto bump = [](std::atomic<std::uint64_t>& cell, std::uint64_t value) {
+      std::uint64_t current = cell.load(std::memory_order_relaxed);
+      while (value > current &&
+             !cell.compare_exchange_weak(current, value,
+                                         std::memory_order_relaxed)) {
+      }
+    };
+    bump(visible_timestamp, timestamp);
+    bump(next_timestamp, timestamp);
+  }
+
+  void publish_timestamp(std::uint64_t timestamp) {
+    while (visible_timestamp.load(std::memory_order_acquire) != timestamp - 1) {
+      std::this_thread::yield();
+    }
+    visible_timestamp.store(timestamp, std::memory_order_release);
   }
 
   std::size_t active_readers() const {
@@ -258,11 +282,7 @@ struct DB::Impl {
 
   TableSlot open_table(std::uint64_t id) const {
     const auto file = path / (std::to_string(id) + ".sst");
-    std::ifstream input(file, std::ios::binary);
-    if (!input) throw Error("manifest references a missing SST");
-    Bytes encoded((std::istreambuf_iterator<char>(input)),
-                  std::istreambuf_iterator<char>());
-    auto table = Table::open(std::move(encoded));
+    auto table = Table::open(file);
     return {id, table, table->block_meta().front().first_key,
             table->block_meta().back().last_key};
   }
@@ -314,12 +334,10 @@ struct DB::Impl {
     state = std::move(recovered);
     for (const auto& slot : state->l0_tables)
       for (auto it = slot.table->iter(); it->valid(); it->next())
-        latest_timestamp.store(
-            std::max(latest_timestamp.load(), it->key().timestamp()));
+        observe_timestamp(it->key().timestamp());
     for (const auto& slot : state->l1_tables)
       for (auto it = slot.table->iter(); it->valid(); it->next())
-        latest_timestamp.store(
-            std::max(latest_timestamp.load(), it->key().timestamp()));
+        observe_timestamp(it->key().timestamp());
     manifest = std::move(recovery.manifest);
     recovered_memtable_ids.assign(live_memtables.begin(), live_memtables.end());
     std::sort(recovered_memtable_ids.begin(), recovered_memtable_ids.end());
@@ -361,8 +379,7 @@ struct DB::Impl {
         const auto key = regular(record.key);
         const auto value = regular(record.value);
         table->put(key, record.timestamp, value);
-        latest_timestamp.store(
-            std::max(latest_timestamp.load(), record.timestamp));
+        observe_timestamp(record.timestamp);
       }
       slots.push_back(
           {id, table,
@@ -411,7 +428,7 @@ struct DB::Impl {
 
     const auto entries = source.table->entries();
     if (entries.empty()) throw Error("cannot flush an empty memtable");
-    TableBuilder builder(options.block_size);
+    TableBuilder builder(options.block_size, options.compression);
     for (const auto& [key, value] : entries) {
       builder.add(key, value);
     }
@@ -420,7 +437,10 @@ struct DB::Impl {
     const auto destination = path / (std::to_string(source.id) + ".sst");
     persist_sst(temporary, destination, encoded);
     const auto flushed = encoded.size();
-    auto table = Table::open(std::move(encoded));
+    counters.sst_raw_bytes.fetch_add(builder.raw_block_bytes(),
+                                     std::memory_order_relaxed);
+    counters.sst_stored_bytes.fetch_add(flushed, std::memory_order_relaxed);
+    auto table = Table::open(destination);
     counters.flush_count.fetch_add(1, std::memory_order_relaxed);
     counters.flush_bytes.fetch_add(flushed, std::memory_order_relaxed);
 
@@ -489,13 +509,17 @@ struct DB::Impl {
   TableSlot write_table(std::uint64_t id,
                         const std::vector<KeyValue>& entries) {
     if (entries.empty()) throw Error("cannot write an empty SST");
-    TableBuilder builder(options.block_size);
+    TableBuilder builder(options.block_size, options.compression);
     for (const auto& [key, value] : entries) builder.add(key, value);
     Bytes encoded = builder.finish();
     const auto temporary = path / (std::to_string(id) + ".sst.tmp");
     const auto destination = path / (std::to_string(id) + ".sst");
     persist_sst(temporary, destination, encoded);
-    auto table = Table::open(std::move(encoded));
+    counters.sst_raw_bytes.fetch_add(builder.raw_block_bytes(),
+                                     std::memory_order_relaxed);
+    counters.sst_stored_bytes.fetch_add(encoded.size(),
+                                        std::memory_order_relaxed);
+    auto table = Table::open(destination);
     return {id, table, table->block_meta().front().first_key,
             table->block_meta().back().last_key};
   }
@@ -565,15 +589,15 @@ struct DB::Impl {
     if (!live.empty()) output = write_table(output_id, live);
     std::uint64_t input_bytes = 0;
     for (const auto& table : captured_l0)
-      input_bytes += table.table->bytes().size();
+      input_bytes += table.table->file_size();
     for (const auto& table : captured_l1)
-      input_bytes += table.table->bytes().size();
+      input_bytes += table.table->file_size();
     counters.compaction_count.fetch_add(1, std::memory_order_relaxed);
     counters.compaction_input_bytes.fetch_add(input_bytes,
                                               std::memory_order_relaxed);
     if (output) {
       counters.compaction_output_bytes.fetch_add(
-          output->table->bytes().size(), std::memory_order_relaxed);
+          output->table->file_size(), std::memory_order_relaxed);
     }
 
     std::unordered_set<std::uint64_t> captured_ids;
@@ -682,8 +706,17 @@ struct DB::Impl {
       std::span<const std::pair<Bytes, Bytes>> entries,
       std::shared_ptr<persistence::MvccWal>* ready_wal = nullptr) {
     require_open();
-    if (entries.empty()) return latest_timestamp.load();
-    const auto timestamp = latest_timestamp.load() + 1;
+    if (entries.empty()) {
+      return visible_timestamp.load(std::memory_order_acquire);
+    }
+    const auto timestamp =
+        next_timestamp.fetch_add(1, std::memory_order_relaxed) + 1;
+    struct Publish {
+      Impl* impl;
+      std::uint64_t ts;
+      ~Publish() { impl->publish_timestamp(ts); }
+    } publish{this, timestamp};
+
     std::vector<KeyValue> versioned;
     std::vector<persistence::MvccWalRecord> wal_records;
     versioned.reserve(entries.size());
@@ -704,10 +737,10 @@ struct DB::Impl {
                                      std::memory_order_relaxed);
       }
       current->put_batch(versioned);
-      latest_timestamp.store(timestamp);
     }
     std::uint64_t user_bytes = 0;
-    for (const auto& [key, value] : entries) user_bytes += key.size() + value.size();
+    for (const auto& [key, value] : entries)
+      user_bytes += key.size() + value.size();
     counters.write_ops.fetch_add(entries.size(), std::memory_order_relaxed);
     counters.write_user_bytes.fetch_add(user_bytes, std::memory_order_relaxed);
     maybe_freeze(current);
@@ -718,11 +751,7 @@ struct DB::Impl {
   std::uint64_t write_entries(
       std::span<const std::pair<Bytes, Bytes>> entries) {
     std::shared_ptr<persistence::MvccWal> wal;
-    std::uint64_t timestamp{};
-    {
-      std::lock_guard commit_lock(commit_mutex);
-      timestamp = write_entries_locked(entries, &wal);
-    }
+    const auto timestamp = write_entries_locked(entries, &wal);
     if (wal) wal->flush_if_needed();
     return timestamp;
   }
@@ -800,7 +829,8 @@ struct DB::Impl {
       if (!user_key_in_table(slot, key) || !slot.table->may_contain(key)) {
         return std::nullopt;
       }
-      return consider(slot.table->get(key, read_timestamp));
+      return consider(slot.table->get(key, read_timestamp, block_cache.get(),
+                                      slot.id));
     };
 
     for (const auto& table : snapshot->l0_tables) {
@@ -813,7 +843,7 @@ struct DB::Impl {
   }
 
   std::optional<Bytes> get(ByteView key) const {
-    return get_at(key, latest_timestamp.load());
+    return get_at(key, visible_timestamp.load(std::memory_order_acquire));
   }
 
   DbIterator scan_at(const KeyBound& lower, const KeyBound& upper,
@@ -847,7 +877,7 @@ struct DB::Impl {
   }
 
   DbIterator scan(const KeyBound& lower, const KeyBound& upper) const {
-    return scan_at(lower, upper, latest_timestamp.load());
+    return scan_at(lower, upper, visible_timestamp.load(std::memory_order_acquire));
   }
 
   std::string dump_structure() const {
@@ -906,6 +936,14 @@ struct DB::Impl {
         counters.compaction_input_bytes.load(std::memory_order_relaxed);
     result.compaction_output_bytes =
         counters.compaction_output_bytes.load(std::memory_order_relaxed);
+    result.sst_raw_bytes =
+        counters.sst_raw_bytes.load(std::memory_order_relaxed);
+    result.sst_stored_bytes =
+        counters.sst_stored_bytes.load(std::memory_order_relaxed);
+    if (block_cache) {
+      result.block_cache_hits = block_cache->hits();
+      result.block_cache_misses = block_cache->misses();
+    }
     result.immutable_memtables = snapshot->immutable_memtables.size();
     result.l0_tables = snapshot->l0_tables.size();
     result.l1_tables = snapshot->l1_tables.size();
@@ -1061,8 +1099,8 @@ struct Transaction::Impl {
 
 std::shared_ptr<Transaction> DB::NewTransaction() {
   impl_->require_open();
-  std::lock_guard commit_lock(impl_->commit_mutex);
-  const auto timestamp = impl_->latest_timestamp.load();
+  const auto timestamp =
+      impl_->visible_timestamp.load(std::memory_order_acquire);
   impl_->add_reader(timestamp);
   return std::shared_ptr<Transaction>(new Transaction(
       std::make_unique<Transaction::Impl>(shared_from_this(), timestamp)));

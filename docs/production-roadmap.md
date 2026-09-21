@@ -100,9 +100,16 @@ Exit gate:
 
 ## Phase 3: sustainable write path
 
+**Partial.** WAL group commit (64 KiB `pwrite` after enqueue) and concurrent
+plain Puts (`fetch_add` timestamp, skip-list insert, MPSC WAL, closed
+`visible_timestamp`) are in the engine. Transaction commit remains mutexed.
+Still missing: independent flush/compaction thread pools, stall metrics as
+admission input, and a feedback write controller.
+
 Make foreground ingestion track background capacity:
 
-- Add atomic write batches and WAL group commit.
+- Add atomic write batches and WAL group commit. **Done** for grouped WAL
+  `pwrite` and `WriteBatch`; durability still lags visibility.
 - Separate visibility from durability and expose explicit sync policies.
 - Run flush and compaction in independent resource pools.
 - Track L0 pressure, immutable-memtable pressure, pending compaction bytes,
@@ -152,77 +159,162 @@ rather than blindly converging to a fixed target layout.
 
 ## Phase 5: portable asynchronous I/O
 
-Introduce one engine-facing completion API with multiple backends:
+One engine-facing completion API; backends are interchangeable and share
+recovery tests.
 
 ```text
-Engine
+Engine (flush / compaction / Get block reads)
   |
-  +-- synchronous pread/pwrite backend
-  +-- portable worker-pool backend
-  +-- Linux io_uring backend
-  +-- fault-injection backend
+  +-- sync: pread / pwrite / fsync          (reference, all platforms)
+  +-- pool: bounded worker threads          (default on macOS / BSD / Unix)
+  +-- io_uring: Linux 5.6+                  (opt-in; fail closed if unavailable)
+  +-- inject: fault / delay / reorder       (tests only)
 ```
 
-The interface must support reads, writes, synchronization, cancellation,
-priorities, deadlines, and completion ownership. Buffers and file handles must
-remain alive until completion, and queue saturation must apply backpressure.
+Do **not** use `epoll` (or kqueue readiness) as the SST/WAL I/O path. Those
+multiplex socket readiness; regular files are typically always readable and
+do not provide completion of `pread`/`pwrite`. `epoll` is only relevant if a
+network server is added later.
 
-For the Linux backend:
+The interface must support reads, writes, fsync, cancellation, priorities
+(foreground Get vs background compaction), and completion ownership. Buffers
+and FDs stay alive until completion. A full queue applies backpressure into
+the write-admission controller (Phase 3).
 
-- Batch adjacent flush and compaction writes.
-- Submit independent SST reads concurrently.
-- Add adaptive read batching that limits queueing delay.
-- Evaluate registered buffers and registered files.
-- Evaluate polling and direct I/O only for I/O-bound configurations.
-- Keep foreground reads separate from background compaction scheduling even if
-  they share rings or device queues.
+Linux `io_uring` requirements:
 
-Exit gate:
-
-- The synchronous and asynchronous backends pass identical fault and recovery
-  tests.
-- Async execution overlaps useful work with I/O.
-- Results show whether gains come from concurrency, batching, or lower
-  submission cost.
-
-PVLDB 2026 reports only modest gains from replacing an existing API with
-`io_uring`, but substantially larger gains when the DBMS is redesigned around
-asynchronous execution, batching, and registered buffers. The implementation
-must therefore follow the staged design above rather than starting with
-low-level ring flags.
-
-## Phase 6: SSD-aware layout
-
-Treat device behavior as an optional policy input:
-
-- Add per-block LZ4 and Zstandard compression.
-- Pack variable-sized compressed blocks without causing avoidable
-  cross-alignment reads.
-- Measure total host and device write amplification where device telemetry is
-  available.
-- Separate hot, short-lived output from cold, long-lived output when placement
-  information is reliable.
-- Add experimental FDP placement hints and ZNS zone append behind capability
-  detection.
-- Preserve the conventional filesystem backend as the default.
+- Batch adjacent flush and compaction writes; submit independent SST reads
+  concurrently.
+- Registered buffers/files and SQPOLL only after a measured I/O-bound
+  baseline; they are not the first switch.
+- Separate foreground and background queues even if they share a ring.
 
 Exit gate:
 
-- Compression reports CPU cost, read amplification, space savings, and total
-  bytes reaching the device.
-- Device-specific modes fail closed when required capabilities are absent.
+- Sync, pool, and (on Linux) io_uring pass the same crash/recovery tests.
+- Ablations report whether gains come from concurrency, batching, or
+  submission cost — not from “enabled io_uring” as a boolean.
 
-Recent PVLDB work on SSD writes shows that lowering database-level write
-amplification can still worsen device-level amplification. Total WAF is the
-metric, and compression or placement must be evaluated with alignment and SSD
-garbage collection in mind.
+PVLDB 2026 (Jasny et al.) found modest gains from swapping an existing API
+for `io_uring`, and large gains only when the engine is built around async
+completion, batching, and registered resources.
+
+## Phase 6: SSD-aware layout (Lee et al. 2–4, LSM form)
+
+Three independent layout work packages. Each has a frozen baseline, a single
+treatment, then a combined run. Do not enable all three in the first
+comparison.
+
+### 6a. Packed block compression (paper §3)
+
+**Status.** Implemented as `Compression::zlib` (not LZ4/Zstd). Uncompressed
+format remains the default. Measure with `hermesdb_bench --compression none|zlib`.
+Alphabet-like bench values compress; random values will not. WAL is uncompressed.
+
+**Baseline.** Uncompressed 4 KiB blocks, `pwrite` of whole SSTs as today.
+
+**Treatment.** Compress each block (zlib today; LZ4/Zstd optional later).
+Concatenate compressed payloads and pack toward 4 KiB device pages; the
+block index stores `(file_offset, compressed_len)`.
+
+**Must not.** Store a 1.5 KiB payload in a 4 KiB slot and call it
+compression. That is the in-place failure mode the paper measures.
+
+**Metrics.** Host bytes written, SST bytes on disk, Get p50/p99, blocks
+read per Get, compress/decompress CPU ns, and (if available) device NAND
+bytes.
+
+### 6b. Lifetime streams (paper §4, file granularity)
+
+**Baseline.** WAL, L0, and lower-level SSTs share one directory / one
+allocator; files interleave on the device.
+
+**Treatment.** Two or more write streams with stable lifetime:
+
+| Stream | Contents | Expected death |
+| ------ | -------- | -------------- |
+| `wal` | redo log | after memtable flush |
+| `hot` | L0 (and optionally L1) | next compaction |
+| `cold` | lower levels | long |
+
+Implementation: separate directories or filesets so the filesystem/FTL
+sees sequential appends per stream. Do **not** mix WAL tail and Lmax SST
+in the same file or the same preallocated extent. Optional later: FDP
+placement IDs or ZNS zones, one per stream; default remains POSIX files.
+
+This is deathtime grouping at SST granularity. Per-key GDT inside an SST
+is out of scope until streams are measurable.
+
+**Metrics.** Same as 6a, plus time-to-delete of each stream’s files
+(histogram), L0 vs Lmax file age, and device WAF if OCP/SMART is present.
+
+### 6c. Host GC unit = device reclaim unit (paper §5)
+
+**Baseline.** `target_sst_size` = 2 MiB (current default). Compaction
+emits many small files.
+
+**Treatment.** Flush and compaction **output** size is
+`max(target_sst_size, reclaim_unit)`, with `reclaim_unit` configured
+explicitly (benchmark flag) or inferred (FDP RU; else a documented
+constant, e.g. 512 MiB–16 GiB swept in the experiment). Writes within
+one SST are sequential. Compaction prefers rewriting a whole stream
+segment so deleting inputs can free a contiguous region rather than
+punching 2 MiB holes.
+
+**Must not.** Increase size-tiering / extra copies to cut *logical* WAF
+while filling the device. Report **total WAF** = host_bytes_written /
+user_put_bytes, and when telemetry exists
+**device WAF** = nand_bytes / host_bytes_written.
+
+**Metrics.** Files created, mean SST size, fragmentation (1 −
+contiguous_free / free), host WAF, device WAF, space amplification,
+throughput after the drive is ≥80% full.
+
+### Benchmark protocol (required for 6a–6c and Phase 5)
+
+Fix: commit, compiler, `Options` except the treatment flag, dataset,
+filesystem, kernel, CPU, memory limit, device model. Fill the device to
+a stated occupancy (e.g. 80–90%) before the measurement window when
+claiming SSD-WAF results.
+
+| Workload | Why |
+| -------- | --- |
+| YCSB-A Zipfian θ = 0.8, dataset ≫ buffer/block cache | paper’s primary |
+| `overwrite` + concurrent Get | mixed read/write tails |
+| `fillrandom` until host writes ≥ 4× dataset | GC/compaction steady state |
+| YCSB-C (read-only, warm) | 6a must not lose point-read tails |
+
+Each treatment vs baseline: ≥3 runs, report median throughput, p50/p99/p99.9,
+host write bytes, WAL+flush+compaction bytes (already in `DB::Metrics`),
+and device NAND bytes when the platform exposes them. A change ships only
+if it improves the **target metric** without a silent regression on the
+others (e.g. 6a must not raise Get p99 more than a stated bound).
+
+I/O backend is a **crossed factor**, not a substitute for 6a–6c:
+
+- macOS/Unix CI: `sync` and `pool`
+- Linux perf machine: `sync`, `pool`, `io_uring`
+
+Claim “io_uring helped” only if `pool` vs `io_uring` differs with 6a–6c
+held fixed.
+
+Exit gate:
+
+- 6a, 6b, and 6c each have a published baseline/treatment table.
+- Compression reports CPU, read amp, space, and host bytes to the device.
+- Lifetime streams can be disabled; device modes fail closed.
+- Combined 6a+6b+6c is measured last, not first.
 
 ## Phase 7: multicore and CPU efficiency
+
+**Partial.** The memtable is a concurrent skip list (insert-only until drop).
+It is not arena-backed. Remaining: shard table-registry / block-cache
+metadata, buffer preallocation, hardware CRC32C, SIMD, NUMA.
 
 Optimize CPU only after I/O and layout are measurable:
 
 - Move the memtable to an arena-backed concurrent skip list or cache-conscious
-  tree.
+  tree. **Skip list: done. Arena: not done.**
 - Shard mutable indexes, table registries, and block-cache metadata.
 - Preallocate WAL, block-builder, and compaction buffers.
 - Add hardware CRC32C with runtime dispatch.

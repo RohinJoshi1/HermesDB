@@ -42,6 +42,7 @@ hermesdb_add_test(transaction)
 hermesdb_add_test(serializable)
 hermesdb_add_test(compaction_filter)
 hermesdb_add_test(capi)
+hermesdb_add_test(compress)
 
 function(hermesdb_add_extra_test name source)
   add_executable(hermesdb_${name}_tests ${source})

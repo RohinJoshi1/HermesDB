@@ -123,6 +123,30 @@ void test_concurrent_force_freeze_never_publishes_empty_memtable() {
   assert(structure.find("entries=0\nimmutable[") == std::string::npos);
 }
 
+void test_concurrent_timestamp_versions() {
+  MemTable memtable;
+  constexpr int writers = 8;
+  constexpr int versions = 50;
+  std::vector<std::thread> threads;
+  threads.reserve(writers);
+  for (int writer = 0; writer < writers; ++writer) {
+    threads.emplace_back([&, writer] {
+      for (int version = 0; version < versions; ++version) {
+        const auto timestamp =
+            static_cast<std::uint64_t>(writer * versions + version + 1);
+        memtable.put(as_bytes("hot"), timestamp, as_bytes("v"));
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  const auto entries = memtable.entries();
+  assert(entries.size() == static_cast<std::size_t>(writers * versions));
+  assert(as_string(entries.front().first.user_key()) == "hot");
+  assert(entries.front().first.timestamp() ==
+         static_cast<std::uint64_t>(writers * versions));
+  assert(text(memtable.get("hot")) == "v");
+}
+
 void test_concurrent_writes_remain_visible() {
   TemporaryDirectory directory;
   auto db = open_db(directory.path, 1U << 20U);
@@ -158,6 +182,7 @@ int main() {
   test_newest_memtable_and_tombstone_win();
   test_capacity_freezes_memtable();
   test_concurrent_force_freeze_never_publishes_empty_memtable();
+  test_concurrent_timestamp_versions();
   test_concurrent_writes_remain_visible();
   std::cout << "Memtable tests passed\n";
 }

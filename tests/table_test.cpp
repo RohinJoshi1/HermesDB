@@ -1,6 +1,9 @@
 #include "hermesdb/table.hpp"
 
 #include <cassert>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -31,6 +34,28 @@ int main() {
   assert(table->read_block_cached(0, 7, cache) == first);
   static_cast<void>(table->read_block_cached(1, 7, cache));
   assert(!cache.Get(7, 0));
+  assert(cache.hits() >= 1);
+  assert(cache.misses() >= 1);
+
+  const Bytes encoded(table->bytes().begin(), table->bytes().end());
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("hermesdb-sst-pread-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()) +
+       ".sst");
+  {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(encoded.data()),
+              static_cast<std::streamsize>(encoded.size()));
+    assert(out);
+  }
+  auto file_table = Table::open(path);
+  assert(file_table->file_size() == encoded.size());
+  assert(file_table->num_blocks() == table->num_blocks());
+  assert(as_string(*file_table->get(as_bytes("key-113"))) == "value-13");
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
 
   std::cout << "SST tests passed\n";
 }

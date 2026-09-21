@@ -34,7 +34,8 @@ target_include_directories(hermesdb
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 find_package(Threads REQUIRED)
-target_link_libraries(hermesdb PUBLIC Threads::Threads)
+find_package(ZLIB REQUIRED)
+target_link_libraries(hermesdb PUBLIC Threads::Threads ZLIB::ZLIB)
 set_target_properties(hermesdb PROPERTIES
   VERSION ${PROJECT_VERSION}
   SOVERSION 0

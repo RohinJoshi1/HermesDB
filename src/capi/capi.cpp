@@ -50,6 +50,7 @@ hermesdb::Options to_options(const hermesdb_options_t* options) {
   if (options->num_memtable_limit != 0) {
     out.num_memtable_limit = options->num_memtable_limit;
   }
+  out.block_cache_capacity = options->block_cache_capacity;
   out.enable_wal = options->enable_wal != 0;
   out.serializable = options->serializable != 0;
   switch (options->compaction) {
@@ -82,6 +83,7 @@ void hermesdb_options_init(hermesdb_options_t* options) {
   options->block_size = 4096;
   options->target_sst_size = 2U << 20U;
   options->num_memtable_limit = 3;
+  options->block_cache_capacity = 4096;
   options->enable_wal = 0;
   options->serializable = 0;
   options->compaction = HERMESDB_COMPACTION_LEVELED;

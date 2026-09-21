@@ -20,6 +20,7 @@ typedef struct hermesdb_options {
   size_t block_size;
   size_t target_sst_size;
   size_t num_memtable_limit;
+  size_t block_cache_capacity;
   int enable_wal;
   int serializable;
   int compaction;

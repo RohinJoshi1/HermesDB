@@ -56,6 +56,7 @@ struct Config {
   std::string compaction{"leveled"};
   std::size_t target_sst_size{1U << 20U};
   std::size_t block_size{4096};
+  std::string compression{"none"};
   bool json{false};
   bool keep_db{false};
   std::uint64_t seed{1};
@@ -79,6 +80,7 @@ struct Config {
       << "  --compaction P      simple|leveled|tiered|none\n"
       << "  --sst-size N        target_sst_size bytes\n"
       << "  --block-size N      SST block size\n"
+      << "  --compression C     none|zlib (default none)\n"
       << "  --path DIR          database directory (default: temp)\n"
       << "  --seed N            RNG seed\n"
       << "  --json              machine-readable output\n"
@@ -135,6 +137,11 @@ Config parse_args(int argc, char** argv) {
           static_cast<std::size_t>(parse_u64(need(arg), arg));
     } else if (arg == "--block-size") {
       config.block_size = static_cast<std::size_t>(parse_u64(need(arg), arg));
+    } else if (arg == "--compression") {
+      config.compression = std::string(need(arg));
+      if (config.compression != "none" && config.compression != "zlib") {
+        usage(argv[0], "--compression must be none or zlib");
+      }
     } else if (arg == "--path") {
       config.path = need(arg);
     } else if (arg == "--seed") {
@@ -420,6 +427,9 @@ int main(int argc, char** argv) {
   options.target_sst_size = config.target_sst_size;
   options.enable_wal = config.enable_wal;
   options.compaction_options = compaction_options(config.compaction);
+  options.compression = config.compression == "zlib"
+                            ? hermesdb::Compression::zlib
+                            : hermesdb::Compression::none;
 
   auto db = hermesdb::DB::Open(config.path, options);
   if (needs_load(config.workload)) {
@@ -449,6 +459,11 @@ int main(int argc, char** argv) {
           ? 0.0
           : static_cast<double>(live_bytes) /
                 static_cast<double>(metrics.write_user_bytes);
+  const double block_compression =
+      metrics.sst_raw_bytes == 0
+          ? 1.0
+          : static_cast<double>(metrics.sst_stored_bytes) /
+                static_cast<double>(metrics.sst_raw_bytes);
 
   const auto commit = shell("git rev-parse --short HEAD 2>/dev/null");
   const auto compiler =
@@ -491,17 +506,28 @@ int main(int argc, char** argv) {
               << metrics.compaction_input_bytes << ",\n"
               << "    \"compaction_output_bytes\": "
               << metrics.compaction_output_bytes << ",\n"
+              << "    \"sst_raw_bytes\": " << metrics.sst_raw_bytes << ",\n"
+              << "    \"sst_stored_bytes\": " << metrics.sst_stored_bytes
+              << ",\n"
               << "    \"immutable_memtables\": " << metrics.immutable_memtables
               << ",\n"
               << "    \"l0_tables\": " << metrics.l0_tables << ",\n"
               << "    \"l1_tables\": " << metrics.l1_tables << ",\n"
+              << "    \"block_cache_hits\": " << metrics.block_cache_hits
+              << ",\n"
+              << "    \"block_cache_misses\": " << metrics.block_cache_misses
+              << ",\n"
               << "    \"live_bytes\": " << live_bytes << "\n"
               << "  },\n"
               << "  \"amplification\": {\n"
               << "    \"write\": " << write_amp << ",\n"
               << "    \"space\": " << space_amp << ",\n"
+              << "    \"block_compression\": " << block_compression << ",\n"
               << "    \"read\": null,\n"
-              << "    \"block_cache\": null\n"
+              << "    \"block_cache_hits\": " << metrics.block_cache_hits
+              << ",\n"
+              << "    \"block_cache_misses\": " << metrics.block_cache_misses
+              << "\n"
               << "  },\n"
               << "  \"environment\": {\n"
               << "    \"commit\": \"" << json_escape(commit) << "\",\n"
@@ -517,12 +543,14 @@ int main(int argc, char** argv) {
               << ",\n"
               << "    \"compaction\": \"" << json_escape(config.compaction)
               << "\",\n"
+              << "    \"compression\": \"" << json_escape(config.compression)
+              << "\",\n"
               << "    \"num\": " << config.num << ",\n"
               << "    \"value_size\": " << config.value_size << ",\n"
               << "    \"seed\": " << config.seed << "\n"
               << "  },\n"
               << "  \"notes\": [\n"
-              << "    \"block cache is not on the DB read path\",\n"
+              << "    \"block cache is an LRU of decoded SST data blocks\",\n"
               << "    \"io_uring is not implemented\",\n"
               << "    \"scans currently materialize the full merged view\"\n"
               << "  ]\n"
@@ -537,10 +565,13 @@ int main(int argc, char** argv) {
               << "p99.9 ns          " << result.latency.percentile(0.999) << '\n'
               << "write_amp         " << write_amp << '\n'
               << "space_amp         " << space_amp << '\n'
+              << "block_compression " << block_compression << '\n'
               << "flush_count       " << metrics.flush_count << '\n'
               << "compaction_count  " << metrics.compaction_count << '\n'
               << "l0_tables         " << metrics.l0_tables << '\n'
-              << "l1_tables         " << metrics.l1_tables << '\n';
+              << "l1_tables         " << metrics.l1_tables << '\n'
+              << "cache_hits        " << metrics.block_cache_hits << '\n'
+              << "cache_misses      " << metrics.block_cache_misses << '\n';
   }
 
   if (!config.keep_db) std::filesystem::remove_all(config.path);
