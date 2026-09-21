@@ -374,8 +374,13 @@ Bytes BloomFilter::Encode() const {
   return encoded;
 }
 
-BlockCache::BlockCache(std::size_t capacity) : capacity_(capacity) {
+BlockCache::BlockCache(std::size_t capacity) {
   if (capacity == 0) throw Error("block cache capacity must be positive");
+  shard_count_ = 1;
+  while (shard_count_ * 2 <= capacity && shard_count_ < 16) shard_count_ *= 2;
+  shard_mask_ = shard_count_ - 1;
+  per_shard_capacity_ = (capacity + shard_count_ - 1) / shard_count_;
+  shards_ = std::make_unique<Shard[]>(shard_count_);
 }
 
 std::size_t BlockCache::KeyHash::operator()(const Key& key) const noexcept {
@@ -384,35 +389,41 @@ std::size_t BlockCache::KeyHash::operator()(const Key& key) const noexcept {
   return first ^ (second + 0x9e3779b9U + (first << 6U) + (first >> 2U));
 }
 
+BlockCache::Shard& BlockCache::shard_for(const Key& key) {
+  return shards_[KeyHash{}(key) & shard_mask_];
+}
+
 std::shared_ptr<const Block> BlockCache::Get(std::uint64_t table_id,
                                               std::size_t block_index) {
-  std::lock_guard lock(mutex_);
   const Key key{table_id, block_index};
-  const auto found = index_.find(key);
-  if (found == index_.end()) {
+  auto& shard = shard_for(key);
+  std::lock_guard lock(shard.mutex);
+  const auto found = shard.index.find(key);
+  if (found == shard.index.end()) {
     misses_.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
   hits_.fetch_add(1, std::memory_order_relaxed);
-  entries_.splice(entries_.begin(), entries_, found->second);
+  shard.entries.splice(shard.entries.begin(), shard.entries, found->second);
   return found->second->second;
 }
 
 void BlockCache::Insert(std::uint64_t table_id, std::size_t block_index,
                         std::shared_ptr<const Block> block) {
   if (!block) throw Error("cannot cache a null block");
-  std::lock_guard lock(mutex_);
   const Key key{table_id, block_index};
-  if (const auto found = index_.find(key); found != index_.end()) {
+  auto& shard = shard_for(key);
+  std::lock_guard lock(shard.mutex);
+  if (const auto found = shard.index.find(key); found != shard.index.end()) {
     found->second->second = std::move(block);
-    entries_.splice(entries_.begin(), entries_, found->second);
+    shard.entries.splice(shard.entries.begin(), shard.entries, found->second);
     return;
   }
-  entries_.emplace_front(key, std::move(block));
-  index_[key] = entries_.begin();
-  if (entries_.size() > capacity_) {
-    index_.erase(entries_.back().first);
-    entries_.pop_back();
+  shard.entries.emplace_front(key, std::move(block));
+  shard.index[key] = shard.entries.begin();
+  if (shard.entries.size() > per_shard_capacity_) {
+    shard.index.erase(shard.entries.back().first);
+    shard.entries.pop_back();
   }
 }
 

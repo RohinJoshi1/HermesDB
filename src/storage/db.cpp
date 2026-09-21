@@ -46,6 +46,83 @@ void validate_value(ByteView value) {
   }
 }
 
+// Global timestamps stay unique, but Put does not wait for a closed prefix.
+// READY slots are packed (8 B). Snapshots wait until the prefix covers every
+// timestamp claimed before begin. Plain Get/Scan read at `claimed()` so
+// read-your-writes does not join the prefix chain.
+class TimestampRings {
+ public:
+  static constexpr std::size_t kCapacity = 8192;
+  static constexpr std::size_t kMask = kCapacity - 1;
+
+  [[nodiscard]] std::uint64_t visible() const noexcept {
+    return visible_.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] std::uint64_t claimed() const noexcept {
+    return next_.load(std::memory_order_acquire);
+  }
+
+  void ensure_space() {
+    while (next_.load(std::memory_order_relaxed) - visible() >= kCapacity) {
+      close_prefix();
+      std::this_thread::yield();
+    }
+  }
+
+  [[nodiscard]] std::uint64_t claim() noexcept {
+    return next_.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  void complete(std::uint64_t timestamp) noexcept {
+    write_[timestamp & kMask].store(timestamp, std::memory_order_release);
+    close_prefix();
+  }
+
+  void wait_quiesced() {
+    wait_closed(claimed());
+  }
+
+  void observe(std::uint64_t timestamp) {
+    auto bump = [](std::atomic<std::uint64_t>& cell, std::uint64_t value) {
+      auto current = cell.load(std::memory_order_relaxed);
+      while (value > current &&
+             !cell.compare_exchange_weak(current, value,
+                                         std::memory_order_relaxed)) {
+      }
+    };
+    bump(next_, timestamp);
+    bump(visible_, timestamp);
+  }
+
+ private:
+  void wait_closed(std::uint64_t target) {
+    while (visible() < target) {
+      close_prefix();
+      std::this_thread::yield();
+    }
+  }
+
+  void close_prefix() noexcept {
+    auto v = visible_.load(std::memory_order_acquire);
+    for (;;) {
+      auto n = v;
+      while (write_[(n + 1) & kMask].load(std::memory_order_acquire) == n + 1) {
+        ++n;
+      }
+      if (n == v) return;
+      if (visible_.compare_exchange_weak(v, n, std::memory_order_release,
+                                         std::memory_order_acquire)) {
+        v = n;
+      }
+    }
+  }
+
+  alignas(64) std::atomic<std::uint64_t> write_[kCapacity]{};
+  alignas(64) std::atomic<std::uint64_t> visible_{0};
+  alignas(64) std::atomic<std::uint64_t> next_{0};
+};
+
 void sync_path(const std::filesystem::path& path, bool directory = false) {
 #ifndef _WIN32
   const int flags = directory ? O_RDONLY : O_RDWR;
@@ -174,10 +251,10 @@ struct DB::Impl {
   Options options;
   mutable std::shared_mutex state_mutex;
   std::mutex state_change_mutex;
+  std::mutex flush_mutex;
   std::shared_ptr<const State> state;
   std::uint64_t next_memtable_id{1};
-  std::atomic<std::uint64_t> next_timestamp{0};
-  std::atomic<std::uint64_t> visible_timestamp{0};
+  TimestampRings timestamps;
   std::mutex commit_mutex;
   mutable std::mutex readers_mutex;
   std::map<std::uint64_t, std::size_t> readers;
@@ -248,26 +325,11 @@ struct DB::Impl {
 
   std::uint64_t watermark() const {
     std::lock_guard lock(readers_mutex);
-    return readers.empty() ? visible_timestamp.load() : readers.begin()->first;
+    return readers.empty() ? timestamps.visible() : readers.begin()->first;
   }
 
   void observe_timestamp(std::uint64_t timestamp) {
-    auto bump = [](std::atomic<std::uint64_t>& cell, std::uint64_t value) {
-      std::uint64_t current = cell.load(std::memory_order_relaxed);
-      while (value > current &&
-             !cell.compare_exchange_weak(current, value,
-                                         std::memory_order_relaxed)) {
-      }
-    };
-    bump(visible_timestamp, timestamp);
-    bump(next_timestamp, timestamp);
-  }
-
-  void publish_timestamp(std::uint64_t timestamp) {
-    while (visible_timestamp.load(std::memory_order_acquire) != timestamp - 1) {
-      std::this_thread::yield();
-    }
-    visible_timestamp.store(timestamp, std::memory_order_release);
+    timestamps.observe(timestamp);
   }
 
   std::size_t active_readers() const {
@@ -397,13 +459,18 @@ struct DB::Impl {
   void maybe_freeze(const std::shared_ptr<MemTable>& expected) {
     if (expected->approximate_size() < options.target_sst_size) return;
 
-    std::unique_lock change_lock(state_change_mutex);
-    std::unique_lock state_lock(state_mutex);
-    if (state->mutable_memtable.table != expected ||
-        expected->approximate_size() < options.target_sst_size) {
-      return;
+    std::shared_ptr<persistence::MvccWal> old_wal;
+    {
+      std::unique_lock change_lock(state_change_mutex, std::try_to_lock);
+      if (!change_lock.owns_lock()) return;
+      std::unique_lock state_lock(state_mutex);
+      if (state->mutable_memtable.table != expected ||
+          expected->approximate_size() < options.target_sst_size) {
+        return;
+      }
+      old_wal = freeze_locked();
     }
-    freeze_locked();
+    if (old_wal) old_wal->flush();
   }
 
   void force_freeze() {
@@ -411,16 +478,23 @@ struct DB::Impl {
     const auto snapshot = state_snapshot();
     const auto expected = snapshot->mutable_memtable.table;
 
-    std::unique_lock change_lock(state_change_mutex);
-    std::unique_lock state_lock(state_mutex);
-    if (state->mutable_memtable.table != expected || expected->empty()) return;
-    freeze_locked();
+    std::shared_ptr<persistence::MvccWal> old_wal;
+    {
+      std::unique_lock change_lock(state_change_mutex);
+      std::unique_lock state_lock(state_mutex);
+      if (state->mutable_memtable.table != expected || expected->empty()) {
+        return;
+      }
+      old_wal = freeze_locked();
+    }
+    if (old_wal) old_wal->flush();
   }
 
   bool flush_oldest_immutable() {
-    std::unique_lock change_lock(state_change_mutex);
+    std::unique_lock flush_lock(flush_mutex);
     MemTableSlot source;
     {
+      std::unique_lock change_lock(state_change_mutex);
       std::shared_lock state_lock(state_mutex);
       if (state->immutable_memtables.empty()) return false;
       source = state->immutable_memtables.back();
@@ -437,27 +511,32 @@ struct DB::Impl {
     const auto destination = path / (std::to_string(source.id) + ".sst");
     persist_sst(temporary, destination, encoded);
     const auto flushed = encoded.size();
-    counters.sst_raw_bytes.fetch_add(builder.raw_block_bytes(),
-                                     std::memory_order_relaxed);
-    counters.sst_stored_bytes.fetch_add(flushed, std::memory_order_relaxed);
     auto table = Table::open(destination);
-    counters.flush_count.fetch_add(1, std::memory_order_relaxed);
-    counters.flush_bytes.fetch_add(flushed, std::memory_order_relaxed);
 
-    manifest->append(persistence::InternalManifestRecord{
-        persistence::ManifestRecordKind::flush, source.id, {}, {}});
-    std::unique_lock state_lock(state_mutex);
-    if (state->immutable_memtables.empty() ||
-        state->immutable_memtables.back().id != source.id) {
-      throw Error("immutable memtable changed during flush");
+    {
+      std::unique_lock change_lock(state_change_mutex);
+      std::unique_lock state_lock(state_mutex);
+      if (state->immutable_memtables.empty() ||
+          state->immutable_memtables.back().id != source.id) {
+        std::error_code ignored;
+        std::filesystem::remove(destination, ignored);
+        return false;
+      }
+      counters.sst_raw_bytes.fetch_add(builder.raw_block_bytes(),
+                                       std::memory_order_relaxed);
+      counters.sst_stored_bytes.fetch_add(flushed, std::memory_order_relaxed);
+      counters.flush_count.fetch_add(1, std::memory_order_relaxed);
+      counters.flush_bytes.fetch_add(flushed, std::memory_order_relaxed);
+      manifest->append(persistence::InternalManifestRecord{
+          persistence::ManifestRecordKind::flush, source.id, {}, {}});
+      auto next = std::make_shared<State>(*state);
+      next->immutable_memtables.pop_back();
+      next->l0_tables.insert(
+          next->l0_tables.begin(),
+          TableSlot{source.id, table, table->block_meta().front().first_key,
+                    table->block_meta().back().last_key});
+      state = std::move(next);
     }
-    auto next = std::make_shared<State>(*state);
-    next->immutable_memtables.pop_back();
-    next->l0_tables.insert(
-        next->l0_tables.begin(),
-        TableSlot{source.id, table, table->block_meta().front().first_key,
-                  table->block_meta().back().last_key});
-    state = std::move(next);
     if (source.wal) {
       source.wal->flush();
       source.wal.reset();
@@ -681,12 +760,12 @@ struct DB::Impl {
     }
   }
 
-  void freeze_locked() {
+  std::shared_ptr<persistence::MvccWal> freeze_locked() {
     auto next = std::make_shared<State>(*state);
     next->immutable_memtables.insert(next->immutable_memtables.begin(),
                                      next->mutable_memtable);
+    auto old_wal = next->mutable_memtable.wal;
     const auto new_id = next_memtable_id++;
-    if (next->mutable_memtable.wal) next->mutable_memtable.wal->flush();
     std::shared_ptr<persistence::MvccWal> wal;
     if (options.enable_wal) {
       wal = std::shared_ptr<persistence::MvccWal>(
@@ -700,6 +779,7 @@ struct DB::Impl {
     state = std::move(next);
     counters.freeze_count.fetch_add(1, std::memory_order_relaxed);
     worker_wake.notify_all();
+    return old_wal;
   }
 
   std::uint64_t write_entries_locked(
@@ -707,16 +787,10 @@ struct DB::Impl {
       std::shared_ptr<persistence::MvccWal>* ready_wal = nullptr) {
     require_open();
     if (entries.empty()) {
-      return visible_timestamp.load(std::memory_order_acquire);
+      return timestamps.visible();
     }
-    const auto timestamp =
-        next_timestamp.fetch_add(1, std::memory_order_relaxed) + 1;
-    struct Publish {
-      Impl* impl;
-      std::uint64_t ts;
-      ~Publish() { impl->publish_timestamp(ts); }
-    } publish{this, timestamp};
-
+    timestamps.ensure_space();
+    const auto timestamp = timestamps.claim();
     std::vector<KeyValue> versioned;
     std::vector<persistence::MvccWalRecord> wal_records;
     versioned.reserve(entries.size());
@@ -728,6 +802,11 @@ struct DB::Impl {
     std::shared_ptr<MemTable> current;
     std::shared_ptr<persistence::MvccWal> wal;
     {
+      struct Complete {
+        TimestampRings* rings;
+        std::uint64_t ts;
+        ~Complete() { rings->complete(ts); }
+      } complete{&timestamps, timestamp};
       std::shared_lock lock(state_mutex);
       current = state->mutable_memtable.table;
       wal = state->mutable_memtable.wal;
@@ -843,7 +922,7 @@ struct DB::Impl {
   }
 
   std::optional<Bytes> get(ByteView key) const {
-    return get_at(key, visible_timestamp.load(std::memory_order_acquire));
+    return get_at(key, timestamps.claimed());
   }
 
   DbIterator scan_at(const KeyBound& lower, const KeyBound& upper,
@@ -877,7 +956,7 @@ struct DB::Impl {
   }
 
   DbIterator scan(const KeyBound& lower, const KeyBound& upper) const {
-    return scan_at(lower, upper, visible_timestamp.load(std::memory_order_acquire));
+    return scan_at(lower, upper, timestamps.claimed());
   }
 
   std::string dump_structure() const {
@@ -1099,8 +1178,8 @@ struct Transaction::Impl {
 
 std::shared_ptr<Transaction> DB::NewTransaction() {
   impl_->require_open();
-  const auto timestamp =
-      impl_->visible_timestamp.load(std::memory_order_acquire);
+  impl_->timestamps.wait_quiesced();
+  const auto timestamp = impl_->timestamps.visible();
   impl_->add_reader(timestamp);
   return std::shared_ptr<Transaction>(new Transaction(
       std::make_unique<Transaction::Impl>(shared_from_this(), timestamp)));

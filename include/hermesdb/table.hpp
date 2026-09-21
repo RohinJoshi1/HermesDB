@@ -66,11 +66,17 @@ class BlockCache {
     std::size_t operator()(const Key& key) const noexcept;
   };
   using Entry = std::pair<Key, std::shared_ptr<const Block>>;
+  struct Shard {
+    alignas(64) std::mutex mutex;
+    std::list<Entry> entries;
+    std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> index;
+  };
 
-  std::size_t capacity_;
-  std::list<Entry> entries_;
-  std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> index_;
-  std::mutex mutex_;
+  [[nodiscard]] Shard& shard_for(const Key& key);
+  std::size_t shard_count_{1};
+  std::size_t shard_mask_{0};
+  std::size_t per_shard_capacity_{1};
+  std::unique_ptr<Shard[]> shards_;
   std::atomic<std::uint64_t> hits_{0};
   std::atomic<std::uint64_t> misses_{0};
 };

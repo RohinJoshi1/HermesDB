@@ -626,8 +626,7 @@ struct MvccWal::Impl {
     queued_bytes.fetch_add(bytes, std::memory_order_release);
   }
 
-  Bytes take(std::size_t minimum) {
-    std::lock_guard lock(drain_mutex);
+  Bytes take_locked(std::size_t minimum) {
     if (queued_bytes.load(std::memory_order_acquire) < minimum) return {};
     Bytes pending;
     Node* current = head;
@@ -645,6 +644,17 @@ struct MvccWal::Impl {
       queued_bytes.fetch_sub(taken, std::memory_order_acq_rel);
     }
     return pending;
+  }
+
+  Bytes take(std::size_t minimum) {
+    std::lock_guard lock(drain_mutex);
+    return take_locked(minimum);
+  }
+
+  Bytes try_take(std::size_t minimum) {
+    std::unique_lock lock(drain_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return {};
+    return take_locked(minimum);
   }
 
   void write_taken(Bytes pending) {
@@ -732,7 +742,7 @@ void MvccWal::append(const MvccWalRecord& record) {
 }
 void MvccWal::flush() { impl_->write_taken(impl_->take(0)); }
 void MvccWal::flush_if_needed() {
-  impl_->write_taken(impl_->take(kWalGroupBytes));
+  impl_->write_taken(impl_->try_take(kWalGroupBytes));
 }
 void MvccWal::sync() {
   flush();

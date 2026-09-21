@@ -13,14 +13,18 @@ flowchart LR
   TS --> WALQ[MPSC WAL queue]
   TS --> Skip[Skip-list memtable]
   WALQ -->|group pwrite 64 KiB| WAL[WAL file]
+  TS --> WriteRing[Packed READY ring]
+  WriteRing --> Vis[Closed prefix]
   Skip -->|Freeze| Imm[Immutable memtables]
   Imm -->|Flush| L0[Overlapping L0 SSTs]
   L0 -->|Compaction| L1[Non-overlapping L1]
-  DB -->|"Get / Scan"| Vis[visible_timestamp]
+  DB -->|"Get / Scan"| Claim[Claim cursor]
+  Claim --> Skip
+  Claim --> Imm
+  Claim --> L0
+  Claim --> L1
+  DB -->|"txn snapshot"| Vis
   Vis --> Skip
-  Vis --> Imm
-  Vis --> L0
-  Vis --> L1
   Manifest[MANIFEST] -. layout .-> L0
   Manifest -. layout .-> L1
 ```
@@ -44,17 +48,23 @@ tests; they are not the supported application surface.
 A plain `Put` / `Delete` / `WriteBatch` does **not** take the transaction
 commit mutex.
 
-1. `timestamp = next_timestamp.fetch_add(1) + 1`.
+1. Claim a timestamp (`fetch_add` on a writer-only cache line).
 2. Encode an MVCC WAL frame (if WAL is enabled) and **MPSC-enqueue** it.
    The frame is in memory; it is not necessarily on disk yet.
 3. Insert `(InternalKey(user, timestamp), value)` into the mutable skip list.
-4. Publish: wait until `visible_timestamp == timestamp - 1`, then store
-   `visible_timestamp = timestamp`. Get/Scan/`NewTransaction` use this
-   **closed prefix**, so they never see commit *T* without *T−1*.
-5. Maybe freeze the memtable if it exceeds `target_sst_size`.
+4. Mark that timestamp READY and try to close the consecutive prefix. Put
+   **does not wait** for other keys’ timestamps. `next_timestamp` and
+   `visible_timestamp` sit on separate cache lines.
+5. Maybe freeze the memtable if it exceeds `target_sst_size`. Only one Put
+   takes the freeze locks; the others return and keep writing.
 6. After the skip-list insert is done, `flush_if_needed` may `pwrite` the WAL
-   when the queue holds at least 64 KiB. `Sync`, freeze, flush, and close
-   drain the queue first.
+   when the queue holds at least 64 KiB and no other thread is already
+   draining. `Sync`, freeze, flush, and close drain the queue first.
+
+Plain `Get` / `Scan` read at the claim cursor so the same thread sees its
+insert without joining the prefix chain. `NewTransaction` waits until the
+closed prefix covers every timestamp claimed before begin (snapshot
+isolation).
 
 Get can return a key whose WAL frame is still queued. That is **visibility
 before durability**, not a broken version order. `Sync()` waits for a drain
@@ -84,13 +94,14 @@ should not receive new Puts.
 
 ## Read path
 
-Point `Get` at `visible_timestamp` (or a transaction’s snapshot timestamp)
+Point `Get` at the claim cursor (or a transaction’s snapshot timestamp)
 walks **newest to oldest**: mutable memtable, immutables, L0, then L1.
 Each SST may skip via Bloom filter and key-range metadata, then `pread`s
 one data block (checksum, optional zlib decode). `DB` keeps an LRU
 `BlockCache` keyed by `(table id, block index)` when
 `Options::block_cache_capacity` is positive (default 4096 blocks; `0`
-disables it). The first visible version at the read timestamp wins; an
+disables it). The cache is split into up to 16 shard LRUs so Gets do not
+share one mutex. The first visible version at the read timestamp wins; an
 empty value is a tombstone.
 
 `Scan` still materializes the merged view. Opening an SST from disk loads
@@ -122,12 +133,16 @@ failures on a complete frame are errors.
 ## Concurrency (current limits)
 
 - Many threads may `Put` at once; Zipfian hot keys still contend on skip-list
-  predecessor locks and on **publish** if a lower timestamp is late.
+  predecessor locks. Put marks READY and returns; it does not wait for a
+  global closed prefix. Snapshots wait for that prefix. Extra Puts skip freeze
+  with `try_lock` instead of queueing on `state_change_mutex`. `BlockCache` is
+  sharded (up to 16 LRUs). Group WAL drain uses `try_lock` so only one thread
+  `pwrite`s.
 - `Get` does not take the commit mutex.
 - Load in `hermesdb_bench` is single-threaded; `--threads` applies to the
   run phase only.
 - `io_uring` / thread-pool I/O backends are not implemented; I/O is
-  synchronous `pwrite`/`pread` (files currently loaded as whole SSTs).
+  synchronous `pwrite`/`pread` (SST Gets `pread` one block).
 
 ## Source layout
 

@@ -4,6 +4,9 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace hermesdb;
 
@@ -61,6 +64,32 @@ int main() {
   assert(scan.valid() && as_string(scan.key()) == "c");
   scan.next();
   assert(!scan.valid());
+
+  {
+    TemporaryDirectory concurrent;
+    Options busy;
+    busy.block_size = 64;
+    busy.target_sst_size = 4096;
+    busy.enable_wal = true;
+    busy.compaction_options = NoCompactionOptions{};
+    auto busy_db = DB::Open(concurrent.path, busy);
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 400;
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+      workers.emplace_back([&, t] {
+        for (int i = 0; i < kPerThread; ++i) {
+          const auto key = "k-" + std::to_string(t) + "-" + std::to_string(i);
+          busy_db->Put(key, "value");
+        }
+      });
+    }
+    for (auto& worker : workers) worker.join();
+    busy_db->ForceFlush();
+    assert(as_string(*busy_db->Get("k-0-0")) == "value");
+    assert(as_string(*busy_db->Get("k-7-399")) == "value");
+  }
 
   std::cout << "Flush tests passed\n";
 }
