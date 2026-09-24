@@ -17,6 +17,19 @@
   a closed prefix. Plain Get/Scan read at the claim cursor (read-your-writes).
   `NewTransaction` waits until the prefix covers timestamps claimed before
   begin.
+- Engine state uses C++20 `std::atomic<std::shared_ptr<const State>>`.
+  Hot Gets and Puts use two-epoch RCU views instead of acquiring shared
+  ownership on every operation. Mutable generations have writer gates, so
+  freeze waits for in-flight writers before publishing an immutable memtable.
+- MVCC WAL append accepts non-owning record views and encodes directly into
+  trailing storage in one queue-node allocation, avoiding owned key/value
+  copies and intermediate payload/frame allocations. WAL drain, write, and
+  sync are serialized to preserve queue order, and drains reuse their staging
+  buffer.
+- Skip-list insertion uses CAS publication instead of locking hot predecessor
+  nodes; exact-key value replacement retains its per-node lock.
+- Timestamp claims reserve READY-ring capacity atomically, preventing
+  concurrent writers from wrapping and overwriting an unclosed slot.
 - Extra Puts skip `maybe_freeze` unless they win `try_lock` on
   `state_change_mutex`, so writers do not queue behind one freeze.
 - `BlockCache` uses up to 16 shard LRUs instead of one mutex.

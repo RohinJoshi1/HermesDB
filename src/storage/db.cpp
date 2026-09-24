@@ -13,14 +13,18 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
-#include <shared_mutex>
 #include <set>
 #include <span>
 #include <sstream>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <variant>
+
+#ifndef __cpp_lib_atomic_shared_ptr
+#error "HermesDB requires C++20 std::atomic<std::shared_ptr<T>> support"
+#endif
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -63,15 +67,20 @@ class TimestampRings {
     return next_.load(std::memory_order_acquire);
   }
 
-  void ensure_space() {
-    while (next_.load(std::memory_order_relaxed) - visible() >= kCapacity) {
-      close_prefix();
-      std::this_thread::yield();
-    }
-  }
-
   [[nodiscard]] std::uint64_t claim() noexcept {
-    return next_.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto current = next_.load(std::memory_order_relaxed);
+    for (;;) {
+      if (current - visible() >= kCapacity) {
+        close_prefix();
+        std::this_thread::yield();
+        current = next_.load(std::memory_order_relaxed);
+        continue;
+      }
+      if (next_.compare_exchange_weak(current, current + 1,
+                                      std::memory_order_relaxed)) {
+        return current + 1;
+      }
+    }
   }
 
   void complete(std::uint64_t timestamp) noexcept {
@@ -153,19 +162,16 @@ void persist_sst(const std::filesystem::path& temporary,
 }
 
 std::uint64_t mvcc_wal_frame_bytes(
-    std::span<const persistence::MvccWalRecord> records) {
+    std::span<const std::pair<Bytes, Bytes>> entries) {
   std::uint64_t bytes = 8;  // payload-size + crc
-  for (const auto& record : records) {
-    bytes += 2 + record.key.size() + 8 + 2 + record.value.size();
+  for (const auto& [key, value] : entries) {
+    bytes += 2 + key.size() + 8 + 2 + value.size();
   }
   return bytes;
 }
 
-persistence::Bytes persistent(ByteView bytes) {
-  persistence::Bytes result;
-  result.reserve(bytes.size());
-  for (const auto byte : bytes) result.push_back(static_cast<std::byte>(byte));
-  return result;
+std::span<const std::byte> persistent_view(ByteView bytes) {
+  return {reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()};
 }
 
 Bytes regular(std::span<const std::byte> bytes) {
@@ -226,9 +232,34 @@ void DbIterator::next() {
 
 struct DB::Impl {
   struct MemTableSlot {
+    struct WriterGate {
+      bool try_enter() noexcept {
+        if (sealed.load(std::memory_order_acquire)) return false;
+        active.fetch_add(1, std::memory_order_acquire);
+        if (!sealed.load(std::memory_order_acquire)) return true;
+        active.fetch_sub(1, std::memory_order_release);
+        return false;
+      }
+
+      void leave() noexcept {
+        active.fetch_sub(1, std::memory_order_release);
+      }
+
+      void seal_and_wait() noexcept {
+        sealed.store(true, std::memory_order_release);
+        while (active.load(std::memory_order_acquire) != 0) {
+          std::this_thread::yield();
+        }
+      }
+
+      std::atomic<std::uint32_t> active{0};
+      std::atomic<bool> sealed{false};
+    };
+
     std::uint64_t id{};
     std::shared_ptr<MemTable> table;
     std::shared_ptr<persistence::MvccWal> wal;
+    std::shared_ptr<WriterGate> writers{std::make_shared<WriterGate>()};
   };
 
   struct TableSlot {
@@ -247,12 +278,50 @@ struct DB::Impl {
     std::vector<TableSlot> l1_tables;
   };
 
+  class StateView {
+   public:
+    StateView() = default;
+    StateView(const State* state, std::atomic<std::uint64_t>* readers)
+        : state_(state), readers_(readers) {}
+    ~StateView() { release(); }
+
+    StateView(StateView&& other) noexcept
+        : state_(std::exchange(other.state_, nullptr)),
+          readers_(std::exchange(other.readers_, nullptr)) {}
+    StateView& operator=(StateView&& other) noexcept {
+      if (this != &other) {
+        release();
+        state_ = std::exchange(other.state_, nullptr);
+        readers_ = std::exchange(other.readers_, nullptr);
+      }
+      return *this;
+    }
+    StateView(const StateView&) = delete;
+    StateView& operator=(const StateView&) = delete;
+
+    [[nodiscard]] const State* operator->() const noexcept { return state_; }
+
+   private:
+    void release() noexcept {
+      if (readers_ != nullptr) {
+        readers_->fetch_sub(1, std::memory_order_release);
+        readers_ = nullptr;
+        state_ = nullptr;
+      }
+    }
+
+    const State* state_{};
+    std::atomic<std::uint64_t>* readers_{};
+  };
+
   std::filesystem::path path;
   Options options;
-  mutable std::shared_mutex state_mutex;
   std::mutex state_change_mutex;
   std::mutex flush_mutex;
-  std::shared_ptr<const State> state;
+  std::atomic<std::shared_ptr<const State>> state;
+  std::atomic<const State*> state_ptr{nullptr};
+  alignas(64) mutable std::atomic<std::uint64_t> state_readers[2]{};
+  alignas(64) std::atomic<std::uint64_t> state_epoch{0};
   std::uint64_t next_memtable_id{1};
   TimestampRings timestamps;
   std::mutex commit_mutex;
@@ -297,7 +366,8 @@ struct DB::Impl {
     }
     auto initial = std::make_shared<State>();
     initial->mutable_memtable = {0, std::make_shared<MemTable>(), nullptr};
-    state = std::move(initial);
+    state_ptr.store(initial.get(), std::memory_order_relaxed);
+    state.store(std::move(initial), std::memory_order_release);
   }
 
   void require_open() const {
@@ -307,8 +377,30 @@ struct DB::Impl {
   }
 
   std::shared_ptr<const State> state_snapshot() const {
-    std::shared_lock lock(state_mutex);
-    return state;
+    return state.load(std::memory_order_acquire);
+  }
+
+  StateView state_view() const {
+    for (;;) {
+      const auto epoch = state_epoch.load(std::memory_order_acquire);
+      auto& readers = state_readers[epoch & 1U];
+      readers.fetch_add(1, std::memory_order_acquire);
+      if (state_epoch.load(std::memory_order_acquire) == epoch) {
+        return {state_ptr.load(std::memory_order_acquire), &readers};
+      }
+      readers.fetch_sub(1, std::memory_order_release);
+    }
+  }
+
+  void publish_state(std::shared_ptr<const State> next) {
+    const auto* next_ptr = next.get();
+    state_ptr.store(next_ptr, std::memory_order_release);
+    const auto old_epoch = state_epoch.fetch_add(1, std::memory_order_acq_rel);
+    auto& old_readers = state_readers[old_epoch & 1U];
+    while (old_readers.load(std::memory_order_acquire) != 0) {
+      std::this_thread::yield();
+    }
+    state.store(std::move(next), std::memory_order_release);
   }
 
   void add_reader(std::uint64_t timestamp) {
@@ -357,7 +449,7 @@ struct DB::Impl {
       return;
     }
     auto recovery = persistence::Manifest::recover(manifest_path);
-    auto recovered = std::make_shared<State>(*state);
+    auto recovered = std::make_shared<State>(*state_snapshot());
     std::vector<std::uint64_t> l0_ids;
     std::vector<std::uint64_t> l1_ids;
     std::unordered_set<std::uint64_t> live_memtables;
@@ -393,11 +485,11 @@ struct DB::Impl {
               [](const TableSlot& lhs, const TableSlot& rhs) {
                 return lhs.first_key < rhs.first_key;
               });
-    state = std::move(recovered);
-    for (const auto& slot : state->l0_tables)
+    publish_state(recovered);
+    for (const auto& slot : recovered->l0_tables)
       for (auto it = slot.table->iter(); it->valid(); it->next())
         observe_timestamp(it->key().timestamp());
-    for (const auto& slot : state->l1_tables)
+    for (const auto& slot : recovered->l1_tables)
       for (auto it = slot.table->iter(); it->valid(); it->next())
         observe_timestamp(it->key().timestamp());
     manifest = std::move(recovery.manifest);
@@ -405,9 +497,9 @@ struct DB::Impl {
     std::sort(recovered_memtable_ids.begin(), recovered_memtable_ids.end());
     if (!options.enable_wal) {
       const auto fresh_id = next_memtable_id++;
-      auto next = std::make_shared<State>(*state);
+      auto next = std::make_shared<State>(*state_snapshot());
       next->mutable_memtable = {fresh_id, std::make_shared<MemTable>(), nullptr};
-      state = std::move(next);
+      publish_state(std::move(next));
       manifest->append(persistence::InternalManifestRecord{
           persistence::ManifestRecordKind::new_memtable, fresh_id, {}, {}});
     }
@@ -416,16 +508,17 @@ struct DB::Impl {
   void recover_wals() {
     if (!options.enable_wal) return;
     if (recovered_memtable_ids.empty()) {
-      const auto id = state->mutable_memtable.id;
+      const auto snapshot = state_snapshot();
+      const auto id = snapshot->mutable_memtable.id;
       const auto wal_path = path / (std::to_string(id) + ".wal");
       auto wal = std::shared_ptr<persistence::MvccWal>(
           persistence::MvccWal::create(wal_path).release());
       sync_path(path, true);
       manifest->append(persistence::InternalManifestRecord{
           persistence::ManifestRecordKind::new_memtable, id, {}, {}});
-      auto next = std::make_shared<State>(*state);
+      auto next = std::make_shared<State>(*snapshot);
       next->mutable_memtable = {id, std::make_shared<MemTable>(), wal};
-      state = std::move(next);
+      publish_state(std::move(next));
       next_memtable_id = std::max(next_memtable_id, id + 1);
       return;
     }
@@ -447,13 +540,17 @@ struct DB::Impl {
           {id, table,
            std::shared_ptr<persistence::MvccWal>(recovery.wal.release())});
     }
-    auto next = std::make_shared<State>(*state);
+    for (auto iterator = slots.begin(); iterator + 1 != slots.end();
+         ++iterator) {
+      iterator->writers->seal_and_wait();
+    }
+    auto next = std::make_shared<State>(*state_snapshot());
     next->mutable_memtable = slots.back();
     for (auto iterator = slots.rbegin() + 1; iterator != slots.rend();
          ++iterator) {
       next->immutable_memtables.push_back(*iterator);
     }
-    state = std::move(next);
+    publish_state(std::move(next));
   }
 
   void maybe_freeze(const std::shared_ptr<MemTable>& expected) {
@@ -463,12 +560,12 @@ struct DB::Impl {
     {
       std::unique_lock change_lock(state_change_mutex, std::try_to_lock);
       if (!change_lock.owns_lock()) return;
-      std::unique_lock state_lock(state_mutex);
-      if (state->mutable_memtable.table != expected ||
+      const auto current = state_snapshot();
+      if (current->mutable_memtable.table != expected ||
           expected->approximate_size() < options.target_sst_size) {
         return;
       }
-      old_wal = freeze_locked();
+      old_wal = freeze_locked(current);
     }
     if (old_wal) old_wal->flush();
   }
@@ -481,11 +578,11 @@ struct DB::Impl {
     std::shared_ptr<persistence::MvccWal> old_wal;
     {
       std::unique_lock change_lock(state_change_mutex);
-      std::unique_lock state_lock(state_mutex);
-      if (state->mutable_memtable.table != expected || expected->empty()) {
+      const auto current = state_snapshot();
+      if (current->mutable_memtable.table != expected || expected->empty()) {
         return;
       }
-      old_wal = freeze_locked();
+      old_wal = freeze_locked(current);
     }
     if (old_wal) old_wal->flush();
   }
@@ -495,9 +592,9 @@ struct DB::Impl {
     MemTableSlot source;
     {
       std::unique_lock change_lock(state_change_mutex);
-      std::shared_lock state_lock(state_mutex);
-      if (state->immutable_memtables.empty()) return false;
-      source = state->immutable_memtables.back();
+      const auto current = state_snapshot();
+      if (current->immutable_memtables.empty()) return false;
+      source = current->immutable_memtables.back();
     }
 
     const auto entries = source.table->entries();
@@ -515,9 +612,9 @@ struct DB::Impl {
 
     {
       std::unique_lock change_lock(state_change_mutex);
-      std::unique_lock state_lock(state_mutex);
-      if (state->immutable_memtables.empty() ||
-          state->immutable_memtables.back().id != source.id) {
+      const auto current = state_snapshot();
+      if (current->immutable_memtables.empty() ||
+          current->immutable_memtables.back().id != source.id) {
         std::error_code ignored;
         std::filesystem::remove(destination, ignored);
         return false;
@@ -529,13 +626,13 @@ struct DB::Impl {
       counters.flush_bytes.fetch_add(flushed, std::memory_order_relaxed);
       manifest->append(persistence::InternalManifestRecord{
           persistence::ManifestRecordKind::flush, source.id, {}, {}});
-      auto next = std::make_shared<State>(*state);
+      auto next = std::make_shared<State>(*current);
       next->immutable_memtables.pop_back();
       next->l0_tables.insert(
           next->l0_tables.begin(),
           TableSlot{source.id, table, table->block_meta().front().first_key,
                     table->block_meta().back().last_key});
-      state = std::move(next);
+      publish_state(std::move(next));
     }
     if (source.wal) {
       source.wal->flush();
@@ -609,9 +706,10 @@ struct DB::Impl {
     std::vector<TableSlot> captured_l1;
     std::uint64_t output_id{};
     {
-      std::unique_lock state_lock(state_mutex);
-      captured_l0 = state->l0_tables;
-      captured_l1 = state->l1_tables;
+      std::unique_lock change_lock(state_change_mutex);
+      const auto current = state_snapshot();
+      captured_l0 = current->l0_tables;
+      captured_l1 = current->l1_tables;
       if (captured_l0.empty() && captured_l1.empty()) return;
       output_id = next_memtable_id++;
     }
@@ -690,8 +788,8 @@ struct DB::Impl {
                                      : std::vector<std::uint64_t>{}});
     {
       std::unique_lock change_lock(state_change_mutex);
-      std::unique_lock state_lock(state_mutex);
-      auto next = std::make_shared<State>(*state);
+      const auto current = state_snapshot();
+      auto next = std::make_shared<State>(*current);
       std::erase_if(next->l0_tables, [&](const TableSlot& table) {
         return captured_ids.contains(table.id);
       });
@@ -703,7 +801,7 @@ struct DB::Impl {
                 [](const TableSlot& lhs, const TableSlot& rhs) {
                   return lhs.first_key < rhs.first_key;
                 });
-      state = std::move(next);
+      publish_state(std::move(next));
     }
     for (const auto id : captured_ids) {
       std::error_code ignored;
@@ -760,11 +858,9 @@ struct DB::Impl {
     }
   }
 
-  std::shared_ptr<persistence::MvccWal> freeze_locked() {
-    auto next = std::make_shared<State>(*state);
-    next->immutable_memtables.insert(next->immutable_memtables.begin(),
-                                     next->mutable_memtable);
-    auto old_wal = next->mutable_memtable.wal;
+  std::shared_ptr<persistence::MvccWal> freeze_locked(
+      const std::shared_ptr<const State>& current) {
+    auto old_wal = current->mutable_memtable.wal;
     const auto new_id = next_memtable_id++;
     std::shared_ptr<persistence::MvccWal> wal;
     if (options.enable_wal) {
@@ -775,8 +871,13 @@ struct DB::Impl {
     }
     manifest->append(persistence::InternalManifestRecord{
         persistence::ManifestRecordKind::new_memtable, new_id, {}, {}});
+
+    auto next = std::make_shared<State>(*current);
+    current->mutable_memtable.writers->seal_and_wait();
+    next->immutable_memtables.insert(next->immutable_memtables.begin(),
+                                     next->mutable_memtable);
     next->mutable_memtable = {new_id, std::make_shared<MemTable>(), wal};
-    state = std::move(next);
+    publish_state(std::move(next));
     counters.freeze_count.fetch_add(1, std::memory_order_relaxed);
     worker_wake.notify_all();
     return old_wal;
@@ -789,39 +890,66 @@ struct DB::Impl {
     if (entries.empty()) {
       return timestamps.visible();
     }
-    timestamps.ensure_space();
     const auto timestamp = timestamps.claim();
     std::vector<KeyValue> versioned;
-    std::vector<persistence::MvccWalRecord> wal_records;
     versioned.reserve(entries.size());
-    wal_records.reserve(entries.size());
     for (const auto& [key, value] : entries) {
       versioned.emplace_back(InternalKey(key, timestamp), value);
-      wal_records.push_back({persistent(key), timestamp, persistent(value)});
     }
     std::shared_ptr<MemTable> current;
     std::shared_ptr<persistence::MvccWal> wal;
-    {
-      struct Complete {
-        TimestampRings* rings;
-        std::uint64_t ts;
-        ~Complete() { rings->complete(ts); }
-      } complete{&timestamps, timestamp};
-      std::shared_lock lock(state_mutex);
-      current = state->mutable_memtable.table;
-      wal = state->mutable_memtable.wal;
-      if (wal) {
-        wal->append_batch(wal_records);
-        counters.wal_bytes.fetch_add(mvcc_wal_frame_bytes(wal_records),
-                                     std::memory_order_relaxed);
+    struct Complete {
+      TimestampRings* rings;
+      std::uint64_t ts;
+      ~Complete() { rings->complete(ts); }
+    } complete{&timestamps, timestamp};
+    std::shared_ptr<MemTableSlot::WriterGate> writers;
+    for (;;) {
+      const auto snapshot = state_view();
+      const auto& slot = snapshot->mutable_memtable;
+      if (!slot.writers->try_enter()) {
+        std::this_thread::yield();
+        continue;
       }
-      current->put_batch(versioned);
+      writers = slot.writers;
+      current = slot.table;
+      wal = slot.wal;
+      break;
     }
+    struct Leave {
+      MemTableSlot::WriterGate* writers;
+      ~Leave() {
+        if (writers != nullptr) writers->leave();
+      }
+      void release() noexcept {
+        if (writers == nullptr) return;
+        writers->leave();
+        writers = nullptr;
+      }
+    } leave{writers.get()};
+    if (wal) {
+      if (entries.size() == 1) {
+        const auto& [key, value] = entries.front();
+        wal->append({persistent_view(key), timestamp, persistent_view(value)});
+      } else {
+        std::vector<persistence::MvccWalRecordView> wal_records;
+        wal_records.reserve(entries.size());
+        for (const auto& [key, value] : entries) {
+          wal_records.push_back(
+              {persistent_view(key), timestamp, persistent_view(value)});
+        }
+        wal->append_batch(wal_records);
+      }
+      counters.wal_bytes.fetch_add(mvcc_wal_frame_bytes(entries),
+                                   std::memory_order_relaxed);
+    }
+    current->put_batch(versioned);
     std::uint64_t user_bytes = 0;
     for (const auto& [key, value] : entries)
       user_bytes += key.size() + value.size();
     counters.write_ops.fetch_add(entries.size(), std::memory_order_relaxed);
     counters.write_user_bytes.fetch_add(user_bytes, std::memory_order_relaxed);
+    leave.release();
     maybe_freeze(current);
     if (ready_wal) *ready_wal = std::move(wal);
     return timestamp;
@@ -882,7 +1010,7 @@ struct DB::Impl {
     require_open();
     validate_key(key);
     counters.get_ops.fetch_add(1, std::memory_order_relaxed);
-    const auto snapshot = state_snapshot();
+    const auto snapshot = state_view();
 
     auto consider = [&](std::optional<Bytes> found)
         -> std::optional<std::optional<Bytes>> {

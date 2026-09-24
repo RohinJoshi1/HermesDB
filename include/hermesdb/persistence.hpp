@@ -38,6 +38,12 @@ struct MvccWalRecord {
   friend bool operator==(const MvccWalRecord&, const MvccWalRecord&) = default;
 };
 
+struct MvccWalRecordView {
+  std::span<const std::byte> key;
+  std::uint64_t timestamp{};
+  std::span<const std::byte> value;
+};
+
 class Wal {
  public:
   struct Recovery {
@@ -86,7 +92,9 @@ class MvccWal {
   MvccWal& operator=(const MvccWal&) = delete;
 
   void append_batch(std::span<const MvccWalRecord> records);
+  void append_batch(std::span<const MvccWalRecordView> records);
   void append(const MvccWalRecord& record);
+  void append(MvccWalRecordView record);
   void flush();
   void flush_if_needed();
   void sync();

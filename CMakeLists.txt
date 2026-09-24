@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.21)
 project(HermesDB VERSION 0.1.0 LANGUAGES C CXX)
 
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 option(HERMESDB_BUILD_TESTS "Build HermesDB tests" ON)
 option(HERMESDB_BUILD_APPS "Build CLI and benchmark binaries" ON)
 option(HERMESDB_BUILD_EXAMPLES "Build API examples" ON)
@@ -9,6 +13,26 @@ set(HERMESDB_SANITIZER "" CACHE STRING "Sanitizer: address, undefined, thread, o
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+include(CheckCXXSourceCompiles)
+
+check_cxx_source_compiles([=[
+  #include <atomic>
+  #include <memory>
+  #ifndef __cpp_lib_atomic_shared_ptr
+  #error "missing P0718R2"
+  #endif
+  int main() {
+    std::atomic<std::shared_ptr<int>> value;
+    value.store(std::make_shared<int>(1));
+    return *value.load() - 1;
+  }
+]=] HERMESDB_HAS_ATOMIC_SHARED_PTR)
+if(NOT HERMESDB_HAS_ATOMIC_SHARED_PTR)
+  message(FATAL_ERROR
+    "HermesDB requires C++20 std::atomic<std::shared_ptr<T>> (P0718R2). "
+    "Apple libc++ and current stable libc++ do not provide it; use "
+    "GCC 12+ with libstdc++ or MSVC STL.")
+endif()
 
 add_library(hermesdb
   src/common/common.cpp

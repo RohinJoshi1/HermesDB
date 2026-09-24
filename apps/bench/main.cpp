@@ -267,7 +267,7 @@ Mix mix_for(std::string_view workload) {
   if (workload == "ycsb-b") return {.read = 95, .update = 5};
   if (workload == "ycsb-c") return {.read = 100};
   if (workload == "ycsb-d") return {.read = 95, .insert = 5};
-  if (workload == "ycsb-e") return {.scan = 95, .insert = 5};
+  if (workload == "ycsb-e") return {.insert = 5, .scan = 95};
   if (workload == "ycsb-f") return {.read = 50, .rmw = 50};
   if (workload == "deleterandom") return {.erase = 100};
   if (workload == "scan") return {.scan = 100};

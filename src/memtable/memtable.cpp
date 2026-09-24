@@ -75,69 +75,58 @@ struct MemTable::SkipList {
   void insert(const InternalKey& key, Bytes value) {
     std::array<Node*, kMaxHeight> preds{};
     std::array<Node*, kMaxHeight> succs{};
+    const int height = random_height();
+    auto* node = new Node(key, std::move(value), height);
+
     for (;;) {
       if (find(key, preds, succs)) {
         Node* existing = succs[0];
         std::lock_guard lock(existing->mutex);
-        if (existing->key == key) {
-          const auto old = existing->value.size();
-          existing->value = std::move(value);
-          if (existing->value.size() >= old) {
-            approximate_size_.fetch_add(existing->value.size() - old,
-                                        std::memory_order_relaxed);
-          } else {
-            approximate_size_.fetch_sub(old - existing->value.size(),
-                                        std::memory_order_relaxed);
-          }
-          return;
+        const auto old = existing->value.size();
+        existing->value = std::move(node->value);
+        delete node;
+        if (existing->value.size() >= old) {
+          approximate_size_.fetch_add(existing->value.size() - old,
+                                      std::memory_order_relaxed);
+        } else {
+          approximate_size_.fetch_sub(old - existing->value.size(),
+                                      std::memory_order_relaxed);
         }
-        continue;
+        return;
       }
 
-      const int height = random_height();
-      int top = max_height_.load(std::memory_order_relaxed);
-      while (height > top && !max_height_.compare_exchange_weak(
-                                 top, height, std::memory_order_relaxed)) {
+      node->next[0].store(succs[0], std::memory_order_relaxed);
+      Node* expected = succs[0];
+      if (preds[0]->next[0].compare_exchange_strong(
+              expected, node, std::memory_order_release,
+              std::memory_order_acquire)) {
+        break;
       }
+    }
 
-      std::vector<Node*> lock_order;
-      lock_order.reserve(static_cast<std::size_t>(height));
-      for (int level = 0; level < height; ++level) {
-        lock_order.push_back(preds[static_cast<std::size_t>(level)]);
-      }
-      std::sort(lock_order.begin(), lock_order.end());
-      lock_order.erase(std::unique(lock_order.begin(), lock_order.end()),
-                       lock_order.end());
+    approximate_size_.fetch_add(
+        node->key.user_key().size() + 8 + node->value.size(),
+        std::memory_order_relaxed);
 
-      std::vector<std::unique_lock<std::mutex>> guards;
-      guards.reserve(lock_order.size());
-      for (Node* node : lock_order) {
-        guards.emplace_back(node->mutex);
-      }
+    int top = max_height_.load(std::memory_order_relaxed);
+    while (height > top && !max_height_.compare_exchange_weak(
+                               top, height, std::memory_order_relaxed)) {
+    }
 
-      bool stale = false;
-      for (int level = 0; level < height; ++level) {
-        if (load(preds[static_cast<std::size_t>(level)]
-                     ->next[static_cast<std::size_t>(level)]) !=
-            succs[static_cast<std::size_t>(level)]) {
-          stale = true;
+    // Level 0 owns the node. Higher levels are best-effort index links:
+    // readers can always descend to level 0 while these CAS loops complete.
+    for (int level = 1; level < height; ++level) {
+      const auto index = static_cast<std::size_t>(level);
+      for (;;) {
+        static_cast<void>(find(key, preds, succs));
+        node->next[index].store(succs[index], std::memory_order_relaxed);
+        Node* expected = succs[index];
+        if (preds[index]->next[index].compare_exchange_strong(
+                expected, node, std::memory_order_release,
+                std::memory_order_acquire)) {
           break;
         }
       }
-      if (stale) continue;
-
-      auto* node = new Node(key, std::move(value), height);
-      approximate_size_.fetch_add(
-          node->key.user_key().size() + 8 + node->value.size(),
-          std::memory_order_relaxed);
-      for (int level = 0; level < height; ++level) {
-        node->next[static_cast<std::size_t>(level)].store(
-            succs[static_cast<std::size_t>(level)], std::memory_order_relaxed);
-        preds[static_cast<std::size_t>(level)]
-            ->next[static_cast<std::size_t>(level)]
-            .store(node, std::memory_order_release);
-      }
-      return;
     }
   }
 

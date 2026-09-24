@@ -560,37 +560,92 @@ namespace {
 
 constexpr std::size_t kWalGroupBytes = 64U * 1024U;
 
-Bytes encode_mvcc_frame(std::span<const MvccWalRecord> records) {
-  Bytes payload;
+std::span<const std::byte> record_key(const MvccWalRecord& record) {
+  return record.key;
+}
+std::span<const std::byte> record_key(const MvccWalRecordView& record) {
+  return record.key;
+}
+std::span<const std::byte> record_value(const MvccWalRecord& record) {
+  return record.value;
+}
+std::span<const std::byte> record_value(const MvccWalRecordView& record) {
+  return record.value;
+}
+
+template <class Record>
+std::size_t mvcc_frame_size(std::span<const Record> records) {
+  std::size_t payload_size = 0;
   for (const auto& record : records) {
-    if (record.key.size() > std::numeric_limits<std::uint16_t>::max())
+    const auto key = record_key(record);
+    const auto value = record_value(record);
+    if (key.size() > std::numeric_limits<std::uint16_t>::max())
       throw std::length_error("MVCC WAL key is too large");
-    if (record.value.size() > std::numeric_limits<std::uint16_t>::max())
+    if (value.size() > std::numeric_limits<std::uint16_t>::max())
       throw std::length_error("MVCC WAL value is too large");
-    if (payload.size() >
-        std::numeric_limits<std::uint32_t>::max() - 12 - record.key.size() -
-            record.value.size())
+    if (payload_size >
+        std::numeric_limits<std::uint32_t>::max() - 12 - key.size() -
+            value.size())
       throw std::length_error("MVCC WAL batch is too large");
-    put_u16(payload, static_cast<std::uint16_t>(record.key.size()));
-    append_bytes(payload, record.key);
-    put_u64(payload, record.timestamp);
-    put_u16(payload, static_cast<std::uint16_t>(record.value.size()));
-    append_bytes(payload, record.value);
+    payload_size += 12 + key.size() + value.size();
   }
-  Bytes frame;
-  frame.reserve(payload.size() + 8);
-  put_u32(frame, static_cast<std::uint32_t>(payload.size()));
-  append_bytes(frame, payload);
-  put_u32(frame, crc32(payload));
-  return frame;
+  return payload_size + 8;
+}
+
+template <class Record>
+void encode_mvcc_frame(std::span<const Record> records,
+                       std::span<std::byte> frame) noexcept {
+  const auto payload_size = frame.size() - 8;
+  std::size_t cursor = 0;
+  const auto write_integer = [&](std::uint64_t value, int bytes) {
+    for (int shift = (bytes - 1) * 8; shift >= 0; shift -= 8) {
+      frame[cursor++] = static_cast<std::byte>(value >> shift);
+    }
+  };
+  write_integer(payload_size, 4);
+  for (const auto& record : records) {
+    const auto key = record_key(record);
+    const auto value = record_value(record);
+    write_integer(key.size(), 2);
+    if (!key.empty())
+      std::memcpy(frame.data() + cursor, key.data(), key.size());
+    cursor += key.size();
+    write_integer(record.timestamp, 8);
+    write_integer(value.size(), 2);
+    if (!value.empty())
+      std::memcpy(frame.data() + cursor, value.data(), value.size());
+    cursor += value.size();
+  }
+  write_integer(crc32(std::span<const std::byte>(frame).subspan(
+                    4, payload_size)),
+                4);
 }
 
 }  // namespace
 
 struct MvccWal::Impl {
   struct Node {
+    explicit Node(std::size_t size = 0) : frame_size(size) {}
+
+    static Node* create(std::size_t frame_size) {
+      void* storage = ::operator new(sizeof(Node) + frame_size);
+      return new (storage) Node(frame_size);
+    }
+
+    static void destroy(Node* node) noexcept {
+      node->~Node();
+      ::operator delete(node);
+    }
+
+    [[nodiscard]] std::span<std::byte> frame() noexcept {
+      return {reinterpret_cast<std::byte*>(this + 1), frame_size};
+    }
+    [[nodiscard]] std::span<const std::byte> frame() const noexcept {
+      return {reinterpret_cast<const std::byte*>(this + 1), frame_size};
+    }
+
     std::atomic<Node*> next{nullptr};
-    Bytes payload;
+    std::size_t frame_size{};
   };
 
   explicit Impl(File file_arg) : file(std::move(file_arg)) {
@@ -601,14 +656,14 @@ struct MvccWal::Impl {
 
   ~Impl() {
     try {
-      write_taken(take(0));
+      drain(0);
     } catch (...) {
     }
     Node* node = head;
     if (node == &stub) node = stub.next.load(std::memory_order_relaxed);
     while (node != nullptr && node != &stub) {
       Node* next = node->next.load(std::memory_order_relaxed);
-      delete node;
+      Node::destroy(node);
       node = next;
     }
   }
@@ -616,49 +671,45 @@ struct MvccWal::Impl {
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
 
-  void enqueue(Bytes frame) {
-    if (frame.empty()) return;
-    auto* node = new Node;
-    node->payload = std::move(frame);
-    const auto bytes = node->payload.size();
+  template <class Record>
+  void enqueue(std::span<const Record> records) {
+    const auto bytes = mvcc_frame_size(records);
+    auto* node = Node::create(bytes);
+    encode_mvcc_frame(records, node->frame());
     Node* prev = tail.exchange(node, std::memory_order_acq_rel);
     prev->next.store(node, std::memory_order_release);
     queued_bytes.fetch_add(bytes, std::memory_order_release);
   }
 
-  Bytes take_locked(std::size_t minimum) {
-    if (queued_bytes.load(std::memory_order_acquire) < minimum) return {};
-    Bytes pending;
+  void drain_locked(std::size_t minimum) {
+    if (queued_bytes.load(std::memory_order_acquire) < minimum) return;
+    drain_buffer.clear();
     Node* current = head;
     Node* next = current->next.load(std::memory_order_acquire);
     while (next != nullptr) {
-      pending.insert(pending.end(), next->payload.begin(), next->payload.end());
+      const auto frame = next->frame();
+      drain_buffer.insert(drain_buffer.end(), frame.begin(), frame.end());
       Node* old = current;
       current = next;
       next = current->next.load(std::memory_order_acquire);
-      if (old != &stub) delete old;
+      if (old != &stub) Node::destroy(old);
     }
     head = current;
-    const auto taken = pending.size();
+    const auto taken = drain_buffer.size();
     if (taken != 0) {
       queued_bytes.fetch_sub(taken, std::memory_order_acq_rel);
+      file.write_all(drain_buffer);
     }
-    return pending;
   }
 
-  Bytes take(std::size_t minimum) {
+  void drain(std::size_t minimum) {
     std::lock_guard lock(drain_mutex);
-    return take_locked(minimum);
+    drain_locked(minimum);
   }
 
-  Bytes try_take(std::size_t minimum) {
+  void try_drain(std::size_t minimum) {
     std::unique_lock lock(drain_mutex, std::try_to_lock);
-    if (!lock.owns_lock()) return {};
-    return take_locked(minimum);
-  }
-
-  void write_taken(Bytes pending) {
-    if (!pending.empty()) file.write_all(pending);
+    if (lock.owns_lock()) drain_locked(minimum);
   }
 
   File file;
@@ -667,6 +718,7 @@ struct MvccWal::Impl {
   std::atomic<Node*> tail{nullptr};
   std::atomic<std::size_t> queued_bytes{0};
   std::mutex drain_mutex;
+  Bytes drain_buffer;
 };
 
 MvccWal::MvccWal(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -735,17 +787,25 @@ MvccWal::Recovery MvccWal::recover(const std::filesystem::path& path) {
 
 void MvccWal::append_batch(std::span<const MvccWalRecord> records) {
   if (records.empty()) return;
-  impl_->enqueue(encode_mvcc_frame(records));
+  impl_->enqueue(records);
+}
+void MvccWal::append_batch(std::span<const MvccWalRecordView> records) {
+  if (records.empty()) return;
+  impl_->enqueue(records);
 }
 void MvccWal::append(const MvccWalRecord& record) {
   append_batch(std::span<const MvccWalRecord>(&record, 1));
 }
-void MvccWal::flush() { impl_->write_taken(impl_->take(0)); }
+void MvccWal::append(MvccWalRecordView record) {
+  append_batch(std::span<const MvccWalRecordView>(&record, 1));
+}
+void MvccWal::flush() { impl_->drain(0); }
 void MvccWal::flush_if_needed() {
-  impl_->write_taken(impl_->try_take(kWalGroupBytes));
+  impl_->try_drain(kWalGroupBytes);
 }
 void MvccWal::sync() {
-  flush();
+  std::lock_guard lock(impl_->drain_mutex);
+  impl_->drain_locked(0);
   impl_->file.sync();
 }
 

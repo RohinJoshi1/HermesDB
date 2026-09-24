@@ -70,10 +70,15 @@ Get can return a key whose WAL frame is still queued. That is **visibility
 before durability**, not a broken version order. `Sync()` waits for a drain
 plus `fsync`.
 
-Freeze takes a unique lock on engine state so in-flight Puts (shared lock
-while inserting) finish on the memtable being frozen. Transaction `Commit`
-still serializes on `commit_mutex` for snapshot isolation / SSI validation;
-those paths are not the YCSB `Put` path.
+Engine state ownership is an atomic `shared_ptr<const State>`. Hot Gets and
+Puts acquire raw state views through a two-epoch reader counter; publication
+advances the epoch and waits for readers of the retired epoch before releasing
+the old owner. Each mutable-memtable generation has a writer gate: freeze
+prepares the next WAL and memtable, seals the old gate, waits only for writers
+already using that generation, then publishes the new state. Flush and
+compaction retain owning snapshots while they work. Transaction `Commit` still
+serializes on `commit_mutex` for snapshot isolation / SSI validation; those
+paths are not the YCSB `Put` path.
 
 ## Memtable skip list
 
@@ -132,12 +137,16 @@ failures on a complete frame are errors.
 
 ## Concurrency (current limits)
 
-- Many threads may `Put` at once; Zipfian hot keys still contend on skip-list
-  predecessor locks. Put marks READY and returns; it does not wait for a
-  global closed prefix. Snapshots wait for that prefix. Extra Puts skip freeze
-  with `try_lock` instead of queueing on `state_change_mutex`. `BlockCache` is
-  sharded (up to 16 LRUs). Group WAL drain uses `try_lock` so only one thread
-  `pwrite`s.
+- Many threads may `Put` at once. Skip-list insertion publishes level 0 with
+  CAS, then installs best-effort upper-level index links without predecessor
+  locks. Put marks READY and returns; it does not wait for a global closed
+  prefix. Snapshots wait for that prefix. Extra Puts skip freeze with
+  `try_lock` instead of queueing on `state_change_mutex`; that mutex serializes
+  publishers only. WAL append accepts non-owning key/value views and encodes
+  directly into trailing storage in a single queue-node allocation. WAL drain
+  reuses a staging buffer and holds its drain mutex through `pwrite`/`sync`, so
+  concurrent drainers cannot reorder queue segments. `BlockCache` is sharded
+  (up to 16 LRUs).
 - `Get` does not take the commit mutex.
 - Load in `hermesdb_bench` is single-threaded; `--threads` applies to the
   run phase only.

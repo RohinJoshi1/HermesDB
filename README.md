@@ -69,12 +69,24 @@ Error strings and `hermesdb_get` buffers are heap-allocated; free them with
 
 ## Build this repository
 
-Requires CMake 3.21+, Ninja, and a C++20 compiler.
+Requires CMake 3.21+, Ninja, and a C++20 standard library implementing
+`std::atomic<std::shared_ptr<T>>` (P0718R2). GCC 12+ with libstdc++ and
+MSVC STL provide it. Stable libc++ does not yet provide this mandatory C++20
+specialization.
 
 ```sh
 cmake --preset default
 cmake --build --preset default
 ctest --preset default --output-on-failure
+```
+
+On Apple Silicon macOS, install Homebrew GCC and use the included presets:
+
+```sh
+brew install gcc
+cmake --preset gcc-debug
+cmake --build --preset gcc-debug
+ctest --preset gcc-debug --output-on-failure
 ```
 
 Examples: `./build/debug/examples/hermesdb_hello_cpp` and

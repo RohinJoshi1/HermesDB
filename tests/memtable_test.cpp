@@ -152,7 +152,8 @@ void test_concurrent_writes_remain_visible() {
   auto db = open_db(directory.path, 1U << 20U);
 
   constexpr std::size_t thread_count = 8;
-  constexpr std::size_t writes_per_thread = 100;
+  // Cross the timestamp READY-ring capacity under concurrent claims.
+  constexpr std::size_t writes_per_thread = 1200;
   std::vector<std::thread> threads;
   threads.reserve(thread_count);
   for (std::size_t thread_id = 0; thread_id < thread_count; ++thread_id) {

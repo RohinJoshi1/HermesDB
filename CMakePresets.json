@@ -43,13 +43,34 @@
       "cacheVariables": {
         "HERMESDB_SANITIZER": "thread"
       }
+    },
+    {
+      "name": "gcc-debug",
+      "displayName": "GCC Debug (macOS Homebrew)",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build/gcc-debug",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/homebrew/opt/gcc/bin/gcc-16",
+        "CMAKE_CXX_COMPILER": "/opt/homebrew/opt/gcc/bin/g++-16"
+      }
+    },
+    {
+      "name": "gcc-release",
+      "displayName": "GCC Release (macOS Homebrew)",
+      "inherits": "gcc-debug",
+      "binaryDir": "${sourceDir}/build/gcc-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     }
   ],
   "buildPresets": [
     { "name": "default", "configurePreset": "default" },
     { "name": "release", "configurePreset": "release" },
     { "name": "asan-ubsan", "configurePreset": "asan-ubsan" },
-    { "name": "tsan", "configurePreset": "tsan" }
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "gcc-debug", "configurePreset": "gcc-debug" },
+    { "name": "gcc-release", "configurePreset": "gcc-release" }
   ],
   "testPresets": [
     {
@@ -65,6 +86,11 @@
     {
       "name": "tsan",
       "configurePreset": "tsan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "gcc-debug",
+      "configurePreset": "gcc-debug",
       "output": { "outputOnFailure": true }
     }
   ]
