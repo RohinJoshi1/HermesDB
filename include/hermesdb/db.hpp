@@ -78,16 +78,25 @@ struct DbMetrics {
 class DbIterator {
  public:
   DbIterator();
-  explicit DbIterator(std::vector<std::pair<Bytes, Bytes>> entries);
+  DbIterator(DbIterator&&) noexcept;
+  DbIterator& operator=(DbIterator&&) noexcept;
+  ~DbIterator();
+
+  DbIterator(const DbIterator&) = delete;
+  DbIterator& operator=(const DbIterator&) = delete;
 
   [[nodiscard]] bool valid() const noexcept;
+  // Views are valid until the next next() or destruction.
   [[nodiscard]] ByteView key() const;
   [[nodiscard]] ByteView value() const;
   void next();
 
  private:
-  std::vector<std::pair<Bytes, Bytes>> entries_;
-  std::size_t index_{};
+  struct Impl;
+  friend class DB;
+  friend class Transaction;
+  explicit DbIterator(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
 };
 
 class DB : public std::enable_shared_from_this<DB> {
@@ -134,6 +143,7 @@ class DB : public std::enable_shared_from_this<DB> {
   std::unique_ptr<Impl> impl_;
 
   friend class Transaction;
+  friend struct DbIterator::Impl;
 };
 
 }  // namespace hermesdb

@@ -34,10 +34,17 @@ class MemTable {
   [[nodiscard]] IteratorPtr iter() const;
   [[nodiscard]] IteratorPtr scan(const InternalKey& lower,
                                  const InternalKey& upper) const;
+  [[nodiscard]] IteratorPtr iter_from(
+      const InternalKey& lower,
+      std::optional<InternalKey> upper = std::nullopt) const;
+  [[nodiscard]] static IteratorPtr iter_from(
+      std::shared_ptr<MemTable> table, const InternalKey& lower,
+      std::optional<InternalKey> upper = std::nullopt);
   [[nodiscard]] std::size_t approximate_size() const;
   [[nodiscard]] bool empty() const;
 
  private:
+  class Cursor;
   struct SkipList;
   std::unique_ptr<SkipList> list_;
 };

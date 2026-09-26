@@ -1,4 +1,5 @@
 #include "hermesdb/memtable.hpp"
+#include "hermesdb/iterator.hpp"
 
 #include <algorithm>
 #include <array>
@@ -220,28 +221,86 @@ std::vector<KeyValue> MemTable::entries() const {
   return all;
 }
 
-IteratorPtr MemTable::iter() const {
-  return std::make_unique<VectorIterator>(entries());
-}
-
-IteratorPtr MemTable::scan(const InternalKey& lower,
-                           const InternalKey& upper) const {
-  std::vector<KeyValue> result;
-  for (auto* node = list_->lower_bound(lower);
-       node != nullptr && node->key < upper;
-       node = list_->load(node->next[0])) {
-    std::lock_guard lock(node->mutex);
-    result.emplace_back(node->key, node->value);
-  }
-  return std::make_unique<VectorIterator>(std::move(result));
-}
-
 std::size_t MemTable::approximate_size() const {
   return list_->approximate_size_.load(std::memory_order_relaxed);
 }
 
 bool MemTable::empty() const {
   return list_->load(list_->head_.next[0]) == nullptr;
+}
+
+class MemTable::Cursor final : public StorageIterator {
+ public:
+  Cursor(std::shared_ptr<MemTable> owner, SkipList* list,
+         const InternalKey& lower, std::optional<InternalKey> upper)
+      : owner_(std::move(owner)), list_(list), upper_(std::move(upper)) {
+    node_ = list_->lower_bound(lower);
+    load();
+  }
+
+  [[nodiscard]] bool valid() const noexcept override { return valid_; }
+
+  [[nodiscard]] const InternalKey& key() const override {
+    if (!valid_ || node_ == nullptr) throw Error("iterator is invalid");
+    return node_->key;
+  }
+
+  [[nodiscard]] InternalKeyView key_view() const override {
+    if (!valid_ || node_ == nullptr) throw Error("iterator is invalid");
+    return as_view(node_->key);
+  }
+
+  [[nodiscard]] ByteView value() const override {
+    if (!valid_) throw Error("iterator is invalid");
+    return value_;
+  }
+
+  void next() override {
+    if (node_ == nullptr) return;
+    node_ = list_->load(node_->next[0]);
+    load();
+  }
+
+ private:
+  void load() {
+    valid_ = false;
+    value_.clear();
+    if (node_ == nullptr) return;
+    if (upper_.has_value() &&
+        compare_internal(as_view(node_->key), as_view(*upper_)) >= 0) {
+      node_ = nullptr;
+      return;
+    }
+    std::lock_guard lock(node_->mutex);
+    value_ = node_->value;
+    valid_ = true;
+  }
+
+  std::shared_ptr<MemTable> owner_;
+  SkipList* list_{};
+  SkipList::Node* node_{};
+  std::optional<InternalKey> upper_;
+  Bytes value_;
+  bool valid_{false};
+};
+
+IteratorPtr MemTable::iter() const { return iter_from(InternalKey{}); }
+
+IteratorPtr MemTable::scan(const InternalKey& lower,
+                           const InternalKey& upper) const {
+  return iter_from(lower, upper);
+}
+
+IteratorPtr MemTable::iter_from(const InternalKey& lower,
+                                std::optional<InternalKey> upper) const {
+  return std::make_unique<Cursor>(nullptr, list_.get(), lower, upper);
+}
+
+IteratorPtr MemTable::iter_from(std::shared_ptr<MemTable> table,
+                                const InternalKey& lower,
+                                std::optional<InternalKey> upper) {
+  auto* list = table->list_.get();
+  return std::make_unique<Cursor>(std::move(table), list, lower, upper);
 }
 
 }  // namespace hermesdb

@@ -1,5 +1,6 @@
 #include "hermesdb/db.hpp"
 
+#include "hermesdb/iterator.hpp"
 #include "hermesdb/memtable.hpp"
 #include "hermesdb/persistence.hpp"
 #include "hermesdb/table.hpp"
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -209,28 +211,9 @@ KeyBound KeyBound::Excluded(std::string_view key) {
   return {BoundKind::excluded, owned(key)};
 }
 
-DbIterator::DbIterator() = default;
-
-DbIterator::DbIterator(std::vector<std::pair<Bytes, Bytes>> entries)
-    : entries_(std::move(entries)) {}
-
-bool DbIterator::valid() const noexcept { return index_ < entries_.size(); }
-
-ByteView DbIterator::key() const {
-  if (!valid()) throw Error("iterator is invalid");
-  return entries_[index_].first;
-}
-
-ByteView DbIterator::value() const {
-  if (!valid()) throw Error("iterator is invalid");
-  return entries_[index_].second;
-}
-
-void DbIterator::next() {
-  if (valid()) ++index_;
-}
-
 struct DB::Impl {
+  friend struct DbIterator::Impl;
+
   struct MemTableSlot {
     struct WriterGate {
       bool try_enter() noexcept {
@@ -1053,35 +1036,74 @@ struct DB::Impl {
     return get_at(key, timestamps.claimed());
   }
 
-  DbIterator scan_at(const KeyBound& lower, const KeyBound& upper,
-                     std::uint64_t read_timestamp) const {
-    require_open();
-    const auto versions = all_versions();
-    std::map<Bytes, Bytes> visible;
-    for (const auto& [internal_key, value] : versions) {
-      if (internal_key.timestamp() > read_timestamp) continue;
-      Bytes user_key(internal_key.user_key().begin(),
-                     internal_key.user_key().end());
-      visible.try_emplace(std::move(user_key), value);
+  [[nodiscard]] static InternalKey scan_lower_internal(const KeyBound& bound) {
+    if (bound.kind == BoundKind::unbounded) return InternalKey(Bytes{}, 0);
+    if (bound.kind == BoundKind::included) {
+      return InternalKey(bound.key, kMaxTimestamp);
     }
-
-    const auto in_bounds = [&lower, &upper](const Bytes& key) {
-      if (lower.kind == BoundKind::included && key < lower.key) return false;
-      if (lower.kind == BoundKind::excluded && key <= lower.key) return false;
-      if (upper.kind == BoundKind::included && key > upper.key) return false;
-      if (upper.kind == BoundKind::excluded && key >= upper.key) return false;
-      return true;
-    };
-    std::vector<std::pair<Bytes, Bytes>> output;
-    for (auto& [key, value] : visible) {
-      if (!value.empty() && in_bounds(key)) {
-        output.emplace_back(std::move(key), std::move(value));
-      }
-    }
-    counters.scan_ops.fetch_add(1, std::memory_order_relaxed);
-    counters.scan_keys.fetch_add(output.size(), std::memory_order_relaxed);
-    return DbIterator(std::move(output));
+    return InternalKey(bound.key, 0);
   }
+
+  [[nodiscard]] static std::optional<InternalKey> scan_upper_internal(
+      const KeyBound& bound) {
+    if (bound.kind == BoundKind::unbounded) return std::nullopt;
+    if (bound.kind == BoundKind::included) return InternalKey(bound.key, 0);
+    return InternalKey(bound.key, kMaxTimestamp);
+  }
+
+  [[nodiscard]] static bool table_overlaps_user_bounds(
+      const TableSlot& slot, const KeyBound& lower, const KeyBound& upper) {
+    const auto& first = slot.first_key.user_key();
+    const auto& last = slot.last_key.user_key();
+    if (upper.kind == BoundKind::included &&
+        bytes_less(upper.key, first)) {
+      return false;
+    }
+    if (upper.kind == BoundKind::excluded &&
+        !bytes_less(first, upper.key)) {
+      return false;
+    }
+    if (lower.kind == BoundKind::included &&
+        bytes_less(last, lower.key)) {
+      return false;
+    }
+    if (lower.kind == BoundKind::excluded &&
+        !bytes_less(lower.key, last)) {
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] IteratorPtr build_merge(const State* snapshot,
+                                        const KeyBound& lower,
+                                        const KeyBound& upper) const {
+    const auto start = scan_lower_internal(lower);
+    const auto stop = scan_upper_internal(upper);
+    std::vector<IteratorPtr> sources;
+    if (!snapshot->mutable_memtable.table->empty()) {
+      sources.push_back(MemTable::iter_from(snapshot->mutable_memtable.table,
+                                            start, stop));
+    }
+    for (const auto& immutable : snapshot->immutable_memtables) {
+      if (immutable.table->empty()) continue;
+      sources.push_back(MemTable::iter_from(immutable.table, start, stop));
+    }
+    BlockCache* cache = block_cache.get();
+    for (const auto& slot : snapshot->l0_tables) {
+      if (!table_overlaps_user_bounds(slot, lower, upper)) continue;
+      sources.push_back(
+          slot.table->iter_scan(start, stop, cache, slot.id));
+    }
+    for (const auto& slot : snapshot->l1_tables) {
+      if (!table_overlaps_user_bounds(slot, lower, upper)) continue;
+      sources.push_back(
+          slot.table->iter_scan(start, stop, cache, slot.id));
+    }
+    return std::make_unique<MergeIterator>(std::move(sources));
+  }
+
+  DbIterator scan_at(const KeyBound& lower, const KeyBound& upper,
+                     std::uint64_t read_timestamp) const;
 
   DbIterator scan(const KeyBound& lower, const KeyBound& upper) const {
     return scan_at(lower, upper, timestamps.claimed());
@@ -1157,6 +1179,201 @@ struct DB::Impl {
     return result;
   }
 };
+
+struct DbIterator::Impl {
+  DB::Impl::StateView pin;
+  IteratorPtr merge;
+  std::uint64_t read_timestamp{kMaxTimestamp};
+  KeyBound lower;
+  KeyBound upper;
+  std::map<Bytes, Bytes> workspace;
+  std::map<Bytes, Bytes>::const_iterator workspace_it{};
+  bool overlay{false};
+  InternalKeyView row_key;
+  ByteView value_view;
+  mutable Bytes key_buffer;
+  mutable bool key_materialized{false};
+  bool valid{false};
+  bool parked_base{false};
+  bool parked_workspace{false};
+  bool past_lower{false};
+  std::uint64_t pending_scan_keys{0};
+  std::atomic<std::uint64_t>* scan_keys{nullptr};
+  std::set<Bytes>* read_set{nullptr};
+
+  ~Impl() { flush_scan_keys(); }
+
+  void flush_scan_keys() {
+    if (scan_keys != nullptr && pending_scan_keys != 0) {
+      scan_keys->fetch_add(pending_scan_keys, std::memory_order_relaxed);
+      pending_scan_keys = 0;
+    }
+  }
+
+  [[nodiscard]] bool in_bounds(const InternalKeyView& key) const {
+    if (!past_lower) {
+      if (lower.kind == BoundKind::included &&
+          compare_user(key, lower.key) < 0) {
+        return false;
+      }
+      if (lower.kind == BoundKind::excluded &&
+          compare_user(key, lower.key) <= 0) {
+        return false;
+      }
+    }
+    if (upper.kind == BoundKind::included &&
+        compare_user(key, upper.key) > 0) {
+      return false;
+    }
+    if (upper.kind == BoundKind::excluded &&
+        compare_user(key, upper.key) >= 0) {
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool in_bounds(ByteView key) const {
+    return in_bounds(InternalKeyView(key, 0));
+  }
+
+  // Leave merge on the next visible, in-bounds, non-tombstone version.
+  void position_base() {
+    if (merge == nullptr) return;
+    while (merge->valid()) {
+      const auto row = merge->key_view();
+      if (row.timestamp() > read_timestamp) {
+        merge->next();
+        continue;
+      }
+      if (merge->value().empty() || !in_bounds(row)) {
+        merge->skip_current_user();
+        continue;
+      }
+      return;
+    }
+  }
+
+  void skip_workspace() {
+    while (workspace_it != workspace.end() &&
+           !in_bounds(workspace_it->first)) {
+      ++workspace_it;
+    }
+  }
+
+  void emit(InternalKeyView next_key, ByteView next_value) {
+    row_key = next_key;
+    value_view = next_value;
+    key_materialized = false;
+    valid = true;
+    past_lower = true;
+    ++pending_scan_keys;
+    if (read_set != nullptr) {
+      next_key.materialize_user(key_buffer);
+      read_set->insert(key_buffer);
+      key_materialized = true;
+    }
+  }
+
+  void take_base() {
+    emit(merge->key_view(), merge->value());
+    parked_base = true;
+  }
+
+  void load() {
+    valid = false;
+    row_key = {};
+    value_view = {};
+    key_materialized = false;
+    if (!overlay) {
+      position_base();
+      if (merge == nullptr || !merge->valid()) return;
+      take_base();
+      return;
+    }
+    for (;;) {
+      position_base();
+      skip_workspace();
+      const bool have_base = merge != nullptr && merge->valid();
+      const bool have_ws = workspace_it != workspace.end();
+      if (!have_base && !have_ws) return;
+      if (!have_ws ||
+          (have_base &&
+           compare_user(merge->key_view(), workspace_it->first) < 0)) {
+        take_base();
+        return;
+      }
+      const bool same =
+          have_base && same_user(merge->key_view(), workspace_it->first);
+      if (same) merge->skip_current_user();
+      if (workspace_it->second.empty()) {
+        ++workspace_it;
+        continue;
+      }
+      emit(InternalKeyView(workspace_it->first, 0), workspace_it->second);
+      parked_workspace = true;
+      return;
+    }
+  }
+
+  void advance() {
+    if (parked_base) {
+      merge->skip_current_user();
+      parked_base = false;
+    } else if (parked_workspace) {
+      ++workspace_it;
+      parked_workspace = false;
+    }
+    load();
+  }
+};
+
+DbIterator::DbIterator() = default;
+
+DbIterator::DbIterator(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+DbIterator::DbIterator(DbIterator&&) noexcept = default;
+DbIterator& DbIterator::operator=(DbIterator&&) noexcept = default;
+DbIterator::~DbIterator() = default;
+
+bool DbIterator::valid() const noexcept {
+  return impl_ != nullptr && impl_->valid;
+}
+
+ByteView DbIterator::key() const {
+  if (!valid()) throw Error("iterator is invalid");
+  if (!impl_->key_materialized) {
+    impl_->row_key.materialize_user(impl_->key_buffer);
+    impl_->key_materialized = true;
+  }
+  return impl_->key_buffer;
+}
+
+ByteView DbIterator::value() const {
+  if (!valid()) throw Error("iterator is invalid");
+  return impl_->value_view;
+}
+
+void DbIterator::next() {
+  if (!valid()) return;
+  impl_->advance();
+}
+
+DbIterator DB::Impl::scan_at(const KeyBound& lower, const KeyBound& upper,
+                             std::uint64_t read_timestamp) const {
+  require_open();
+  counters.scan_ops.fetch_add(1, std::memory_order_relaxed);
+  auto pin = state_view();
+  const auto* snapshot = pin.operator->();
+  auto impl = std::make_unique<DbIterator::Impl>();
+  impl->merge = build_merge(snapshot, lower, upper);
+  impl->pin = std::move(pin);
+  impl->read_timestamp = read_timestamp;
+  impl->lower = lower;
+  impl->upper = upper;
+  impl->scan_keys = &counters.scan_keys;
+  impl->load();
+  return DbIterator(std::move(impl));
+}
 
 std::shared_ptr<DB> DB::Open(const std::filesystem::path& path,
                                        Options options) {
@@ -1348,34 +1565,23 @@ std::optional<Bytes> Transaction::Get(std::string_view key) const {
 
 DbIterator Transaction::Scan(KeyBound lower, KeyBound upper) const {
   if (impl_->committed) throw Error("transaction is already committed");
-  auto base =
-      impl_->database->impl_->scan_at(lower, upper, impl_->read_timestamp);
-  std::map<Bytes, Bytes> visible;
-  while (base.valid()) {
-    visible.emplace(Bytes(base.key().begin(), base.key().end()),
-                    Bytes(base.value().begin(), base.value().end()));
-    base.next();
-  }
-  const auto in_bounds = [&lower, &upper](const Bytes& key) {
-    if (lower.kind == BoundKind::included && key < lower.key) return false;
-    if (lower.kind == BoundKind::excluded && key <= lower.key) return false;
-    if (upper.kind == BoundKind::included && key > upper.key) return false;
-    if (upper.kind == BoundKind::excluded && key >= upper.key) return false;
-    return true;
-  };
-  for (const auto& [key, value] : impl_->workspace) {
-    if (!in_bounds(key)) continue;
-    if (value.empty())
-      visible.erase(key);
-    else
-      visible[key] = value;
-  }
-  std::vector<std::pair<Bytes, Bytes>> output(visible.begin(), visible.end());
-  for (const auto& [key, value] : output) {
-    static_cast<void>(value);
-    impl_->read_set.insert(key);
-  }
-  return DbIterator(std::move(output));
+  auto& database = *impl_->database->impl_;
+  database.counters.scan_ops.fetch_add(1, std::memory_order_relaxed);
+  auto pin = database.state_view();
+  const auto* snapshot = pin.operator->();
+  auto iterator_impl = std::make_unique<DbIterator::Impl>();
+  iterator_impl->merge = database.build_merge(snapshot, lower, upper);
+  iterator_impl->pin = std::move(pin);
+  iterator_impl->read_timestamp = impl_->read_timestamp;
+  iterator_impl->lower = lower;
+  iterator_impl->upper = upper;
+  iterator_impl->workspace = impl_->workspace;
+  iterator_impl->workspace_it = iterator_impl->workspace.begin();
+  iterator_impl->overlay = true;
+  iterator_impl->scan_keys = &database.counters.scan_keys;
+  iterator_impl->read_set = &impl_->read_set;
+  iterator_impl->load();
+  return DbIterator(std::move(iterator_impl));
 }
 
 void Transaction::Put(ByteView key, ByteView value) {

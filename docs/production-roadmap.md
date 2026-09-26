@@ -82,14 +82,12 @@ Exit gate:
 
 Remove avoidable work before introducing specialized I/O:
 
-- Replace materialized scans with lazy iterators from memtable through SST.
-- Add block restart points and binary search within SST indexes.
-- Use a heap for large fan-in merges while preserving source precedence.
+- Add block restart points inside SST data blocks.
 - Add a sharded block cache with explicit memory accounting.
-- Separate cache admission from eviction so long scans do not evict hot point
-  lookup data.
 - Partition indexes and filters so metadata does not scale as one monolith.
-- Add sequential readahead and bounded scan prefetch.
+- Add sequential readahead and bounded scan prefetch. **Done:** a scan
+  cache miss `pread`s the current block plus the next 4 (`F_RDADVISE` /
+  `posix_fadvise` on the same span). Not an async I/O queue.
 - Reduce key/value copies with owned block handles and lifetime-safe views.
 
 Exit gate:

@@ -378,8 +378,8 @@ RunResult run_workers(hermesdb::DB& db, const Config& config,
                         hermesdb::KeyBound::Unbounded());
             std::uint64_t seen = 0;
             while (iterator.valid() && seen < config.scan_len) {
-              iterator.next();
               ++seen;
+              iterator.next();
             }
           } else if (take(mix.rmw)) {
             const auto id = chooser.next();
@@ -552,7 +552,7 @@ int main(int argc, char** argv) {
               << "  \"notes\": [\n"
               << "    \"block cache is an LRU of decoded SST data blocks\",\n"
               << "    \"io_uring is not implemented\",\n"
-              << "    \"scans currently materialize the full merged view\"\n"
+              << "    \"scans are lazy heap-merged cursors\"\n"
               << "  ]\n"
               << "}\n";
   } else {

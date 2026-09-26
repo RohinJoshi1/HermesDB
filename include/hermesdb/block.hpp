@@ -14,6 +14,9 @@ class Block {
   [[nodiscard]] bool empty() const noexcept { return offsets_.empty(); }
   [[nodiscard]] ByteView data() const noexcept { return data_; }
   [[nodiscard]] std::uint16_t offset(std::size_t index) const;
+  [[nodiscard]] Bytes first_encoded_key() const;
+  [[nodiscard]] InternalKey key_at(std::size_t index,
+                                   const Bytes& first_encoded) const;
 
  private:
   friend class BlockBuilder;
@@ -42,16 +45,21 @@ class BlockIterator final : public StorageIterator {
   explicit BlockIterator(std::shared_ptr<const Block> block);
   [[nodiscard]] bool valid() const noexcept override;
   [[nodiscard]] const InternalKey& key() const override;
+  [[nodiscard]] InternalKeyView key_view() const override;
   [[nodiscard]] ByteView value() const override;
   void next() override;
+  void skip_current_user() override;
   void seek_to_first();
   void seek(const InternalKey& target);
 
  private:
   void decode_entry(std::size_t index);
+  void materialize_key() const;
   std::shared_ptr<const Block> block_;
   std::size_t index_{};
-  InternalKey key_;
+  InternalKeyView view_{};
+  mutable InternalKey key_;
+  mutable bool key_ready_{};
   Bytes first_key_;
   ByteView value_;
   bool valid_{};

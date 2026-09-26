@@ -109,9 +109,18 @@ disables it). The cache is split into up to 16 shard LRUs so Gets do not
 share one mutex. The first visible version at the read timestamp wins; an
 empty value is a tombstone.
 
-`Scan` still materializes the merged view. Opening an SST from disk loads
-only the index and Bloom filter; `Table::open(Bytes)` still holds a full
-in-memory image for unit tests.
+`Scan` is a move-only cursor over one state snapshot. Memtable and SST
+sources are seeked, heap-merged by `InternalKey` (newer sources win on
+ties), then collapsed to the newest visible user key. Tombstones and
+keys outside the requested bounds are skipped as the cursor advances.
+SST scans admit blocks as non-point cache entries (they cannot evict
+point-read blocks). A cache miss reads the current block plus the next four
+in one `pread`, decodes them into the cache, and hints kernel readahead on
+file-backed tables. Opening an SST from disk
+loads only the index and Bloom filter; `Table::open(Bytes)` still holds
+a full in-memory image for unit tests. A `DbIterator` must not be used
+after `DB::Close`; a transaction scan must be consumed before `Commit`
+and is invalid after the transaction completes.
 
 ## SST layout and compression
 

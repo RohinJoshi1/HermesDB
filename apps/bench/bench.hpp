@@ -50,18 +50,28 @@ class Histogram {
   }
 
  private:
+  static constexpr std::size_t kSubBuckets = 8;
+
   static std::size_t bucket_for(std::uint64_t nanos) {
     if (nanos <= 1) return 0;
-    std::size_t bucket = 0;
+    std::size_t log = 0;
     auto value = nanos;
     while (value > 1) {
       value >>= 1;
-      ++bucket;
+      ++log;
     }
-    return bucket;
+    const auto base = std::uint64_t{1} << log;
+    const auto frac = static_cast<std::size_t>(
+        (nanos - base) * kSubBuckets / base);
+    return 1 + log * kSubBuckets + std::min(frac, kSubBuckets - 1);
   }
   static std::uint64_t bucket_ns(std::size_t bucket) {
-    return bucket == 0 ? 1 : (std::uint64_t{1} << bucket);
+    if (bucket == 0) return 1;
+    const auto scaled = bucket - 1;
+    const auto log = scaled / kSubBuckets;
+    const auto frac = scaled % kSubBuckets;
+    const auto base = std::uint64_t{1} << log;
+    return base + base * (frac + 1) / kSubBuckets;
   }
 
   std::vector<std::uint64_t> counts_;

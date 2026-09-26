@@ -50,8 +50,8 @@ separately from plain `Put`.
 
 ## Scans
 
-`Scan(lower, upper)` returns a `DbIterator`. Bounds may be unbounded, included,
-or excluded:
+`Scan(lower, upper)` returns a move-only `DbIterator` that yields rows
+lazily. Bounds may be unbounded, included, or excluded:
 
 ```cpp
 auto iterator = db->Scan(
@@ -64,8 +64,9 @@ while (iterator.valid()) {
 }
 ```
 
-`key()` and `value()` return non-owning views. Copy them before advancing the
-iterator if they must be retained.
+`key()` and `value()` return non-owning views valid until `next()`. Copy
+them if they must be retained. Transaction scans overlay the local
+workspace; consume the iterator before `Commit()`.
 
 ## Transactions
 

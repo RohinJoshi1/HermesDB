@@ -37,6 +37,17 @@ int main() {
   assert(cache.hits() >= 1);
   assert(cache.misses() >= 1);
 
+  BlockCache protected_cache(1);
+  auto pinned = table->read_block_cached(0, 9, protected_cache);
+  static_cast<void>(table->read_block_for_scan(1, &protected_cache, 9));
+  assert(protected_cache.Get(9, 0) == pinned);
+
+  BlockCache prefetch_cache(16);
+  const auto head = table->read_block_for_scan(0, &prefetch_cache, 3);
+  assert(prefetch_cache.Get(3, 0) == head);
+  assert(prefetch_cache.Contains(3, 1));
+  if (table->num_blocks() > 2) assert(prefetch_cache.Contains(3, 2));
+
   const Bytes encoded(table->bytes().begin(), table->bytes().end());
   const auto path =
       std::filesystem::temp_directory_path() /

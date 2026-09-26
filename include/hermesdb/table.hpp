@@ -46,9 +46,12 @@ class BlockCache {
  public:
   explicit BlockCache(std::size_t capacity);
   [[nodiscard]] std::shared_ptr<const Block> Get(std::uint64_t table_id,
-                                                  std::size_t block_index);
+                                                  std::size_t block_index,
+                                                  bool promote = false);
   void Insert(std::uint64_t table_id, std::size_t block_index,
-              std::shared_ptr<const Block> block);
+              std::shared_ptr<const Block> block, bool point = true);
+  [[nodiscard]] bool Contains(std::uint64_t table_id,
+                              std::size_t block_index);
   [[nodiscard]] std::uint64_t hits() const noexcept {
     return hits_.load(std::memory_order_relaxed);
   }
@@ -65,7 +68,11 @@ class BlockCache {
   struct KeyHash {
     std::size_t operator()(const Key& key) const noexcept;
   };
-  using Entry = std::pair<Key, std::shared_ptr<const Block>>;
+  struct Entry {
+    Key key;
+    std::shared_ptr<const Block> block;
+    bool point{false};
+  };
   struct Shard {
     alignas(64) std::mutex mutex;
     std::list<Entry> entries;
@@ -83,7 +90,7 @@ class BlockCache {
 
 class SstFile;
 
-class Table {
+class Table : public std::enable_shared_from_this<Table> {
  public:
   [[nodiscard]] static std::shared_ptr<Table> open(Bytes encoded);
   [[nodiscard]] static std::shared_ptr<Table> open(
@@ -108,8 +115,23 @@ class Table {
       BlockCache* cache = nullptr, std::uint64_t table_id = 0) const;
   [[nodiscard]] IteratorPtr iter() const;
   [[nodiscard]] IteratorPtr iter_from(const InternalKey& key) const;
+  [[nodiscard]] IteratorPtr iter_scan(
+      const InternalKey& lower, std::optional<InternalKey> upper,
+      BlockCache* cache = nullptr, std::uint64_t table_id = 0) const;
+  [[nodiscard]] std::shared_ptr<const Block> read_block_for_scan(
+      std::size_t index, BlockCache* cache,
+      std::uint64_t table_id) const;
+  void prefetch_scan_blocks(std::size_t after, std::size_t window,
+                            BlockCache* cache, std::uint64_t table_id) const;
 
  private:
+  [[nodiscard]] std::size_t block_span(std::size_t index) const;
+  [[nodiscard]] std::shared_ptr<const Block> decode_stored(
+      std::size_t index, ByteView stored) const;
+  std::shared_ptr<const Block> fill_scan_window(std::size_t start,
+                                                std::size_t count,
+                                                BlockCache* cache,
+                                                std::uint64_t table_id) const;
   Table(Bytes bytes, std::unique_ptr<SstFile> file, std::vector<BlockMeta> meta,
         std::uint32_t meta_offset, BloomFilter bloom, std::uint64_t file_size);
   Bytes bytes_;

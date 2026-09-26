@@ -14,8 +14,10 @@ class StorageIterator {
   virtual ~StorageIterator() = default;
   [[nodiscard]] virtual bool valid() const noexcept = 0;
   [[nodiscard]] virtual const InternalKey& key() const = 0;
+  [[nodiscard]] virtual InternalKeyView key_view() const = 0;
   [[nodiscard]] virtual ByteView value() const = 0;
   virtual void next() = 0;
+  virtual void skip_current_user();
 };
 
 using IteratorPtr = std::unique_ptr<StorageIterator>;
@@ -26,6 +28,7 @@ class VectorIterator final : public StorageIterator {
   explicit VectorIterator(std::vector<KeyValue> entries);
   [[nodiscard]] bool valid() const noexcept override;
   [[nodiscard]] const InternalKey& key() const override;
+  [[nodiscard]] InternalKeyView key_view() const override;
   [[nodiscard]] ByteView value() const override;
   void next() override;
 
@@ -39,13 +42,23 @@ class MergeIterator final : public StorageIterator {
   explicit MergeIterator(std::vector<IteratorPtr> children);
   [[nodiscard]] bool valid() const noexcept override;
   [[nodiscard]] const InternalKey& key() const override;
+  [[nodiscard]] InternalKeyView key_view() const override;
   [[nodiscard]] ByteView value() const override;
   void next() override;
+  void skip_current_user() override;
 
  private:
-  void select_current();
+  [[nodiscard]] bool ahead(std::size_t a, std::size_t b) const;
+  void push(std::size_t child);
+  void pop();
+  void sift_up(std::size_t index);
+  void sift_down(std::size_t index);
+  [[nodiscard]] std::size_t top() const;
+
   std::vector<IteratorPtr> children_;
-  std::optional<std::size_t> current_;
+  std::vector<std::size_t> heap_;
+  Bytes previous_user_;
+  std::uint64_t previous_timestamp_{};
 };
 
 class RangeIterator final : public StorageIterator {
@@ -55,6 +68,7 @@ class RangeIterator final : public StorageIterator {
                 bool upper_inclusive);
   [[nodiscard]] bool valid() const noexcept override;
   [[nodiscard]] const InternalKey& key() const override;
+  [[nodiscard]] InternalKeyView key_view() const override;
   [[nodiscard]] ByteView value() const override;
   void next() override;
 

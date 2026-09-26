@@ -1,9 +1,11 @@
 #include "hermesdb/table.hpp"
+#include "hermesdb/iterator.hpp"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cerrno>
+#include <climits>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -266,6 +268,20 @@ class SstFile {
     return out;
   }
 
+  void advise(std::uint64_t offset, std::size_t length) const {
+    if (fd_ < 0 || length == 0) return;
+#ifdef __APPLE__
+    struct radvisory hint {};
+    hint.ra_offset = static_cast<off_t>(offset);
+    hint.ra_count = static_cast<int>(
+        std::min(length, static_cast<std::size_t>(INT_MAX)));
+    ::fcntl(fd_, F_RDADVISE, &hint);
+#elif !defined(_WIN32)
+    ::posix_fadvise(fd_, static_cast<off_t>(offset),
+                    static_cast<off_t>(length), POSIX_FADV_WILLNEED);
+#endif
+  }
+
  private:
   int fd_{-1};
   std::uint64_t size_{};
@@ -394,7 +410,8 @@ BlockCache::Shard& BlockCache::shard_for(const Key& key) {
 }
 
 std::shared_ptr<const Block> BlockCache::Get(std::uint64_t table_id,
-                                              std::size_t block_index) {
+                                              std::size_t block_index,
+                                              bool promote) {
   const Key key{table_id, block_index};
   auto& shard = shard_for(key);
   std::lock_guard lock(shard.mutex);
@@ -404,27 +421,52 @@ std::shared_ptr<const Block> BlockCache::Get(std::uint64_t table_id,
     return {};
   }
   hits_.fetch_add(1, std::memory_order_relaxed);
+  if (promote) found->second->point = true;
   shard.entries.splice(shard.entries.begin(), shard.entries, found->second);
-  return found->second->second;
+  return found->second->block;
+}
+
+bool BlockCache::Contains(std::uint64_t table_id, std::size_t block_index) {
+  const Key key{table_id, block_index};
+  auto& shard = shard_for(key);
+  std::lock_guard lock(shard.mutex);
+  return shard.index.find(key) != shard.index.end();
 }
 
 void BlockCache::Insert(std::uint64_t table_id, std::size_t block_index,
-                        std::shared_ptr<const Block> block) {
+                        std::shared_ptr<const Block> block, bool point) {
   if (!block) throw Error("cannot cache a null block");
   const Key key{table_id, block_index};
   auto& shard = shard_for(key);
   std::lock_guard lock(shard.mutex);
   if (const auto found = shard.index.find(key); found != shard.index.end()) {
-    found->second->second = std::move(block);
+    found->second->block = std::move(block);
+    found->second->point = found->second->point || point;
     shard.entries.splice(shard.entries.begin(), shard.entries, found->second);
     return;
   }
-  shard.entries.emplace_front(key, std::move(block));
+
+  auto evict_one = [&](bool scan_only) {
+    if (shard.entries.size() < per_shard_capacity_) return true;
+    if (!scan_only) {
+      shard.index.erase(shard.entries.back().key);
+      shard.entries.pop_back();
+      return true;
+    }
+    for (auto it = shard.entries.end(); it != shard.entries.begin();) {
+      --it;
+      if (!it->point) {
+        shard.index.erase(it->key);
+        shard.entries.erase(it);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (!evict_one(!point)) return;
+  shard.entries.push_front(Entry{key, std::move(block), point});
   shard.index[key] = shard.entries.begin();
-  if (shard.entries.size() > per_shard_capacity_) {
-    shard.index.erase(shard.entries.back().first);
-    shard.entries.pop_back();
-  }
 }
 
 Table::Table(Bytes bytes, std::unique_ptr<SstFile> file,
@@ -460,7 +502,7 @@ bool Table::may_contain(ByteView user_key) const noexcept {
   return bloom_.MayContain(checksum(user_key));
 }
 
-std::shared_ptr<const Block> Table::read_block(std::size_t index) const {
+std::size_t Table::block_span(std::size_t index) const {
   if (index >= meta_.size()) throw Error("table block index out of range");
   const std::size_t begin = meta_[index].offset;
   const std::size_t span =
@@ -473,30 +515,90 @@ std::shared_ptr<const Block> Table::read_block(std::size_t index) const {
       static_cast<std::uint64_t>(begin) + span > file_size_) {
     throw Error("corrupt table block span");
   }
-  Bytes owned;
-  ByteView stored;
-  if (file_) {
-    owned = file_->pread(begin, span);
-    stored = owned;
-  } else {
-    stored = ByteView(bytes_).subspan(begin, span);
-  }
+  return span;
+}
+
+std::shared_ptr<const Block> Table::decode_stored(std::size_t index,
+                                                  ByteView stored) const {
   if (meta_[index].size != 0) {
     return Block::decode(decode_packed_payload(stored));
   }
   const ByteView encoded = stored.subspan(0, stored.size() - 4);
-  if (checksum(encoded) != read_u32(stored, span - 4)) {
+  if (checksum(encoded) != read_u32(stored, stored.size() - 4)) {
     throw Error("table block checksum mismatch");
   }
   return Block::decode(Bytes(encoded.begin(), encoded.end()));
 }
 
+std::shared_ptr<const Block> Table::read_block(std::size_t index) const {
+  const auto span = block_span(index);
+  const std::size_t begin = meta_[index].offset;
+  if (file_) {
+    const auto owned = file_->pread(begin, span);
+    return decode_stored(index, owned);
+  }
+  return decode_stored(index, ByteView(bytes_).subspan(begin, span));
+}
+
 std::shared_ptr<const Block> Table::read_block_cached(
     std::size_t index, std::uint64_t table_id, BlockCache& cache) const {
-  if (auto cached = cache.Get(table_id, index)) return cached;
+  if (auto cached = cache.Get(table_id, index, true)) return cached;
   auto block = read_block(index);
-  cache.Insert(table_id, index, block);
+  cache.Insert(table_id, index, block, true);
   return block;
+}
+
+constexpr std::size_t kScanPrefetchBlocks = 4;
+
+std::shared_ptr<const Block> Table::fill_scan_window(
+    std::size_t start, std::size_t count, BlockCache* cache,
+    std::uint64_t table_id) const {
+  if (cache == nullptr || count == 0 || start >= meta_.size()) return {};
+  const std::size_t end = std::min(meta_.size(), start + count);
+  const std::size_t first = meta_[start].offset;
+  const std::size_t last = meta_[end - 1].offset;
+  const std::size_t total = last + block_span(end - 1) - first;
+  std::shared_ptr<const Block> head;
+  if (file_ != nullptr) {
+    file_->advise(first, total);
+    const auto owned = file_->pread(first, total);
+    const ByteView window = owned;
+    for (std::size_t index = start; index < end; ++index) {
+      if (index != start && cache->Contains(table_id, index)) continue;
+      const auto block = decode_stored(
+          index, window.subspan(meta_[index].offset - first, block_span(index)));
+      cache->Insert(table_id, index, block, false);
+      if (index == start) head = block;
+    }
+    return head;
+  }
+  for (std::size_t index = start; index < end; ++index) {
+    if (index != start && cache->Contains(table_id, index)) continue;
+    auto block = read_block(index);
+    cache->Insert(table_id, index, block, false);
+    if (index == start) head = std::move(block);
+  }
+  return head;
+}
+
+std::shared_ptr<const Block> Table::read_block_for_scan(
+    std::size_t index, BlockCache* cache, std::uint64_t table_id) const {
+  if (cache == nullptr) return read_block(index);
+  if (auto cached = cache->Get(table_id, index)) return cached;
+  if (auto filled = fill_scan_window(index, 1 + kScanPrefetchBlocks, cache,
+                                     table_id)) {
+    return filled;
+  }
+  auto block = read_block(index);
+  cache->Insert(table_id, index, block, false);
+  return block;
+}
+
+void Table::prefetch_scan_blocks(std::size_t after, std::size_t window,
+                                 BlockCache* cache,
+                                 std::uint64_t table_id) const {
+  if (after + 1 >= meta_.size()) return;
+  static_cast<void>(fill_scan_window(after + 1, window, cache, table_id));
 }
 
 std::size_t Table::find_block(const InternalKey& key) const {
@@ -537,32 +639,108 @@ std::optional<Bytes> Table::get(ByteView user_key,
   return Bytes(iterator.value().begin(), iterator.value().end());
 }
 
-IteratorPtr Table::iter() const {
-  std::vector<KeyValue> entries;
-  for (std::size_t i = 0; i < meta_.size(); ++i) {
-    BlockIterator iterator(read_block(i));
-    while (iterator.valid()) {
-      entries.emplace_back(iterator.key(),
-                           Bytes(iterator.value().begin(), iterator.value().end()));
-      iterator.next();
+class TableCursor final : public StorageIterator {
+ public:
+  TableCursor(std::shared_ptr<const Table> table, const InternalKey& lower,
+              std::optional<InternalKey> upper, BlockCache* cache,
+              std::uint64_t table_id)
+      : table_(std::move(table)),
+        upper_(std::move(upper)),
+        cache_(cache),
+        table_id_(table_id) {
+    if (table_->num_blocks() == 0) return;
+    block_index_ = table_->find_block(lower);
+    load_block(true, lower);
+  }
+
+  [[nodiscard]] bool valid() const noexcept override { return valid_; }
+
+  [[nodiscard]] const InternalKey& key() const override {
+    if (!valid_ || block_iter_ == nullptr) throw Error("iterator is invalid");
+    return block_iter_->key();
+  }
+
+  [[nodiscard]] InternalKeyView key_view() const override {
+    if (!valid_ || block_iter_ == nullptr) throw Error("iterator is invalid");
+    return block_iter_->key_view();
+  }
+
+  [[nodiscard]] ByteView value() const override {
+    if (!valid_ || block_iter_ == nullptr) throw Error("iterator is invalid");
+    return block_iter_->value();
+  }
+
+  void next() override {
+    if (!valid_ || block_iter_ == nullptr) return;
+    block_iter_->next();
+    if (accept_current()) return;
+    ++block_index_;
+    load_block(false, InternalKey{});
+  }
+
+  void skip_current_user() override {
+    if (!valid_ || block_iter_ == nullptr) return;
+    const auto parked = block_iter_->key_view();
+    const auto pin = block_;
+    next();
+    while (valid_ && same_user(key_view(), parked)) next();
+    static_cast<void>(pin);
+  }
+
+ private:
+  [[nodiscard]] bool accept_current() const {
+    if (block_iter_ == nullptr || !block_iter_->valid()) return false;
+    if (!upper_.has_value()) return true;
+    return compare_internal(block_iter_->key_view(), as_view(*upper_)) < 0;
+  }
+
+  void load_block(bool seek, const InternalKey& target) {
+    valid_ = false;
+    block_iter_.reset();
+    while (block_index_ < table_->num_blocks()) {
+      block_ = table_->read_block_for_scan(block_index_, cache_, table_id_);
+      block_iter_ = std::make_unique<BlockIterator>(block_);
+      if (seek) {
+        block_iter_->seek(target);
+      }
+      if (accept_current()) {
+        valid_ = true;
+        return;
+      }
+      ++block_index_;
+      seek = false;
     }
   }
-  return std::make_unique<VectorIterator>(std::move(entries));
+
+  std::shared_ptr<const Table> table_;
+  std::optional<InternalKey> upper_;
+  BlockCache* cache_{};
+  std::uint64_t table_id_{};
+  std::size_t block_index_{0};
+  std::shared_ptr<const Block> block_;
+  std::unique_ptr<BlockIterator> block_iter_;
+  bool valid_{false};
+};
+
+IteratorPtr Table::iter() const {
+  if (meta_.empty()) {
+    return std::make_unique<VectorIterator>(std::vector<KeyValue>{});
+  }
+  return iter_scan(meta_.front().first_key, std::nullopt);
 }
 
 IteratorPtr Table::iter_from(const InternalKey& key) const {
-  std::vector<KeyValue> entries;
-  const auto first_block = find_block(key);
-  for (std::size_t i = first_block; i < meta_.size(); ++i) {
-    BlockIterator iterator(read_block(i));
-    if (i == first_block) iterator.seek(key);
-    while (iterator.valid()) {
-      entries.emplace_back(iterator.key(),
-                           Bytes(iterator.value().begin(), iterator.value().end()));
-      iterator.next();
-    }
+  if (meta_.empty()) {
+    return std::make_unique<VectorIterator>(std::vector<KeyValue>{});
   }
-  return std::make_unique<VectorIterator>(std::move(entries));
+  return iter_scan(key, std::nullopt);
+}
+
+IteratorPtr Table::iter_scan(const InternalKey& lower,
+                             std::optional<InternalKey> upper, BlockCache* cache,
+                             std::uint64_t table_id) const {
+  return std::make_unique<TableCursor>(shared_from_this(), lower, upper, cache,
+                                       table_id);
 }
 
 TableBuilder::TableBuilder(std::size_t block_size, Compression compression)

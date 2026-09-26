@@ -13,6 +13,13 @@
 
 ### Changed
 
+- SST scan cache misses read the current block plus the next four in one
+  `pread`, insert them as non-point cache entries, and hint kernel readahead.
+- `Scan` is a move-only lazy cursor: memtable and SST sources are seeked,
+  heap-merged, then collapsed to the newest visible user key. Memory stays
+  proportional to source count and the current block, not result size.
+  Transaction scans overlay a workspace snapshot and record the read set as
+  rows are emitted. Consume a transaction scan before `Commit`.
 - Puts claim a timestamp, insert, mark READY, and return without waiting for
   a closed prefix. Plain Get/Scan read at the claim cursor (read-your-writes).
   `NewTransaction` waits until the prefix covers timestamps claimed before

@@ -22,6 +22,8 @@ endfunction()
 
 hermesdb_add_test(memtable)
 hermesdb_add_test(iterator)
+hermesdb_add_test(scan)
+hermesdb_add_test(scan_concurrency)
 hermesdb_add_test(block)
 hermesdb_add_test(table)
 hermesdb_add_test(read_path)
