@@ -1,3 +1,4 @@
+#include "hermesdb/common.hpp"
 #include "hermesdb/persistence.hpp"
 
 #include <algorithm>
@@ -429,13 +430,9 @@ struct LockedFile {
 }  // namespace
 
 std::uint32_t crc32(std::span<const std::byte> data) noexcept {
-  std::uint32_t crc = 0xffffffffU;
-  for (const std::byte byte : data) {
-    crc ^= std::to_integer<std::uint8_t>(byte);
-    for (int bit = 0; bit != 8; ++bit)
-      crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
-  }
-  return ~crc;
+  return hermesdb::checksum(
+      hermesdb::ByteView{reinterpret_cast<const hermesdb::Byte*>(data.data()),
+                         data.size()});
 }
 
 std::uint32_t crc32(std::string_view data) noexcept { return crc32(as_bytes(data)); }

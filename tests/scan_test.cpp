@@ -5,6 +5,7 @@
 #include "hermesdb/table.hpp"
 #include "hermesdb/transaction.hpp"
 
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <filesystem>
@@ -140,6 +141,34 @@ void test_flush_and_transaction_overlay() {
   txn->Commit();
 }
 
+void test_simd_key_compare() {
+  const auto a16 = as_bytes("0123456789abcdef");
+  const auto b16 = as_bytes("0123456789abcdee");
+  const auto c16 = as_bytes("1123456789abcdef");
+  assert(compare_bytes(a16, a16) == 0);
+  assert(compare_bytes(a16, b16) > 0);
+  assert(compare_bytes(b16, a16) < 0);
+  assert(compare_bytes(a16, c16) < 0);
+  assert(compare_bytes(as_bytes("ab"), as_bytes("abc")) < 0);
+  assert(compare_bytes({}, {}) == 0);
+  assert(compare_bytes(as_bytes("z"), {}) > 0);
+
+  Bytes long_a(32, 'a');
+  Bytes long_b(32, 'a');
+  long_b[17] = 'b';
+  assert(compare_bytes(long_a, long_b) < 0);
+
+  std::array<ScanRow, 4> rows{};
+  Bytes k0(a16.begin(), a16.end());
+  Bytes k1(a16.begin(), a16.end());
+  Bytes k2(c16.begin(), c16.end());
+  rows[0] = {InternalKeyView(k0, 3), {}};
+  rows[1] = {InternalKeyView(k1, 2), {}};
+  rows[2] = {InternalKeyView(k2, 1), {}};
+  assert(leading_same_user({rows.data(), 3}, k0) == 2);
+  assert(same_user(InternalKeyView(k0, 1), k0));
+}
+
 void test_segmented_key_view() {
   BlockBuilder builder(256);
   assert(builder.add(InternalKey("prefix-aaa", 3), as_bytes("v1")));
@@ -178,6 +207,46 @@ void test_multi_block_table_scan() {
   }
   assert((keys == std::vector<std::string>{"k105", "k106", "k107", "k108",
                                            "k109"}));
+
+  std::array<ScanRow, kScanBatch> batch{};
+  auto pull_it = table->iter_scan(InternalKey{}, InternalKey("k999"));
+  keys.clear();
+  std::string previous;
+  for (;;) {
+    const auto n = pull_it->pull(batch);
+    if (n == 0) break;
+    for (std::size_t i = 0; i < n; ++i) {
+      Bytes user;
+      batch[i].key.materialize_user(user);
+      keys.emplace_back(as_string(user));
+      if (!previous.empty()) assert(keys.back() > previous);
+      previous = keys.back();
+    }
+  }
+  assert(keys.size() == 20);
+}
+
+void test_multi_sst_full_scan() {
+  TemporaryDirectory directory;
+  Options options;
+  options.block_size = 64;
+  options.target_sst_size = 2048;
+  options.enable_wal = false;
+  auto db = DB::Open(directory.path, options);
+  for (int i = 0; i < 400; ++i) {
+    db->Put("k" + std::to_string(i), "v0");
+  }
+  db->ForceFreezeMemTable();
+  db->ForceFlush();
+  std::string previous;
+  int count = 0;
+  for (auto it = db->Scan(); it.valid(); it.next()) {
+    const auto key = as_string(it.key());
+    assert(previous.empty() || key > previous);
+    previous = key;
+    ++count;
+  }
+  assert(count == 400);
 }
 
 }  // namespace
@@ -187,7 +256,9 @@ int main() {
   test_merge_source_priority();
   test_db_scan_oracle();
   test_flush_and_transaction_overlay();
+  test_simd_key_compare();
   test_segmented_key_view();
   test_multi_block_table_scan();
+  test_multi_sst_full_scan();
   std::cout << "Scan tests passed\n";
 }

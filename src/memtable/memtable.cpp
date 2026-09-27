@@ -261,6 +261,17 @@ class MemTable::Cursor final : public StorageIterator {
     load();
   }
 
+  std::size_t pull(std::span<ScanRow> out) override {
+    std::size_t n = 0;
+    while (n < out.size() && valid_) {
+      value_slots_[n].assign(value_.begin(), value_.end());
+      out[n] = {as_view(node_->key), value_slots_[n]};
+      ++n;
+      next();
+    }
+    return n;
+  }
+
  private:
   void load() {
     valid_ = false;
@@ -281,6 +292,7 @@ class MemTable::Cursor final : public StorageIterator {
   SkipList::Node* node_{};
   std::optional<InternalKey> upper_;
   Bytes value_;
+  std::array<Bytes, kScanBatch> value_slots_{};
   bool valid_{false};
 };
 

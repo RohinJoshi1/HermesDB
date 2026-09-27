@@ -82,13 +82,18 @@ Exit gate:
 
 Remove avoidable work before introducing specialized I/O:
 
-- Add block restart points inside SST data blocks.
+- Add block restart points inside SST data blocks. **Done:** interval 16,
+  prefix vs last restart, seek on restart keys. Legacy footers still decode.
 - Add a sharded block cache with explicit memory accounting.
 - Partition indexes and filters so metadata does not scale as one monolith.
 - Add sequential readahead and bounded scan prefetch. **Done:** a scan
   cache miss `pread`s the current block plus the next 4 (`F_RDADVISE` /
   `posix_fadvise` on the same span). Not an async I/O queue.
 - Reduce key/value copies with owned block handles and lifetime-safe views.
+- Scan sources pull 16-row batches (one restart). Public `next()` pops a
+  filtered batch. Merge copies the batch so child views can be refilled.
+- SIMD user-key compare and same-user skip (NEON / SSE2, 16-byte chunks).
+  Scalar memcmp for tails and other lengths.
 
 Exit gate:
 
@@ -315,7 +320,9 @@ Optimize CPU only after I/O and layout are measurable:
   tree. **Skip list: done. Arena: not done.**
 - Shard mutable indexes, table registries, and block-cache metadata.
 - Preallocate WAL, block-builder, and compaction buffers.
-- Add hardware CRC32C with runtime dispatch.
+- Add hardware CRC32C with runtime dispatch. **Partial:** on-disk checksum
+  is still zlib CRC-32 (format compatible). ARM uses `crc32`, elsewhere
+  slicing-by-8. CRC-32C would be a poly change.
 - Evaluate SIMD common-prefix and Bloom-filter hashing.
 - Add NUMA-aware placement only after cross-socket effects are reproduced.
 

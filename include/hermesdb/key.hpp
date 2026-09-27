@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hermesdb/common.hpp"
+#include "hermesdb/simd.hpp"
 
 #include <algorithm>
 #include <compare>
@@ -92,10 +93,10 @@ class InternalKeyView {
     const ByteView sb =
         ib < b0.size() ? b0.subspan(ib) : b1.subspan(ib - b0.size());
     const std::size_t take = std::min(sa.size(), sb.size());
-    const int cmp = std::memcmp(sa.data(), sb.data(), take);
-    if (cmp != 0) {
-      return cmp < 0 ? std::strong_ordering::less
-                     : std::strong_ordering::greater;
+    if (const auto order =
+            simd::compare_equal_len(sa.data(), sb.data(), take);
+        order != 0) {
+      return order;
     }
     ia += take;
     ib += take;
@@ -105,11 +106,15 @@ class InternalKeyView {
 
 [[nodiscard]] inline std::strong_ordering compare_user(
     const InternalKeyView& lhs, const InternalKeyView& rhs) noexcept {
+  if (lhs.suffix().empty() && rhs.suffix().empty()) {
+    return compare_bytes(lhs.prefix(), rhs.prefix());
+  }
   return compare_concat(lhs.prefix(), lhs.suffix(), rhs.prefix(), rhs.suffix());
 }
 
 [[nodiscard]] inline std::strong_ordering compare_user(
     const InternalKeyView& lhs, ByteView rhs) noexcept {
+  if (lhs.suffix().empty()) return compare_bytes(lhs.prefix(), rhs);
   return compare_concat(lhs.prefix(), lhs.suffix(), rhs, {});
 }
 

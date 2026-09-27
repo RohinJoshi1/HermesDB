@@ -1,6 +1,5 @@
 #include "hermesdb/key.hpp"
 
-#include <algorithm>
 #include <cstring>
 
 namespace hermesdb {
@@ -71,10 +70,10 @@ InternalKey InternalKey::decode(ByteView encoded) {
 
 std::strong_ordering operator<=>(const InternalKey& lhs,
                                  const InternalKey& rhs) noexcept {
-  const auto key_order = std::lexicographical_compare_three_way(
-      lhs.user_key_.begin(), lhs.user_key_.end(), rhs.user_key_.begin(),
-      rhs.user_key_.end());
-  if (key_order != 0) return key_order;
+  if (const auto key_order = compare_bytes(lhs.user_key_, rhs.user_key_);
+      key_order != 0) {
+    return key_order;
+  }
   return rhs.timestamp_ <=> lhs.timestamp_;
 }
 

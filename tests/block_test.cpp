@@ -6,6 +6,8 @@
 using namespace hermesdb;
 
 int main() {
+  assert(checksum(as_bytes("123456789")) == 0xcbf43926U);
+
   InternalKey key("plain-user-key");
   assert(key.encode().size() == std::string_view("plain-user-key").size() + 8);
   assert(InternalKey::decode(key.encode()) == key);
@@ -37,5 +39,22 @@ int main() {
   BlockBuilder tiny(12);
   assert(tiny.add(InternalKey("oversized"), as_bytes("allowed")));
   assert(!tiny.add(InternalKey("next"), as_bytes("rejected")));
+
+  BlockBuilder wide(4096);
+  for (int i = 0; i < 40; ++i) {
+    assert(wide.add(InternalKey("prefix-" + std::to_string(100 + i),
+                                static_cast<std::uint64_t>(i)),
+                    as_bytes("v")));
+  }
+  auto restarted = wide.finish();
+  assert(restarted->restart_interval() == kBlockRestartInterval);
+  assert(restarted->restart_base(16) == 16);
+  BlockIterator walk(restarted);
+  walk.seek(InternalKey("prefix-116", kMaxTimestamp));
+  assert(walk.valid());
+  assert(as_string(walk.key().user_key()) == "prefix-116");
+  walk.seek(InternalKey("prefix-139", kMaxTimestamp));
+  assert(walk.valid());
+  assert(as_string(walk.key().user_key()) == "prefix-139");
   std::cout << "Block tests passed\n";
 }

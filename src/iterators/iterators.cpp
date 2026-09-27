@@ -34,108 +34,155 @@ void VectorIterator::next() {
   if (valid()) ++index_;
 }
 
+std::size_t VectorIterator::pull(std::span<ScanRow> out) {
+  std::size_t n = 0;
+  while (n < out.size() && valid()) {
+    out[n++] = {as_view(entries_[index_].first), entries_[index_].second};
+    ++index_;
+  }
+  return n;
+}
+
 MergeIterator::MergeIterator(std::vector<IteratorPtr> children)
-    : children_(std::move(children)) {
-  heap_.reserve(children_.size());
-  for (std::size_t i = 0; i < children_.size(); ++i) push(i);
+    : children_(std::move(children)), batches_(children_.size()) {
+  for (std::size_t i = 0; i < children_.size(); ++i) refill_child(i);
 }
 
-bool MergeIterator::valid() const noexcept { return !heap_.empty(); }
-
-std::size_t MergeIterator::top() const {
-  if (heap_.empty()) throw Error("iterator is invalid");
-  return heap_.front();
+bool MergeIterator::valid() const noexcept {
+  for (std::size_t i = 0; i < children_.size(); ++i) {
+    if (!batches_[i].empty() || children_[i]->valid()) return true;
+  }
+  return false;
 }
 
-const InternalKey& MergeIterator::key() const { return children_[top()]->key(); }
+void MergeIterator::prime() {
+  for (std::size_t i = 0; i < children_.size(); ++i) {
+    if (batches_[i].empty()) refill_child(i);
+  }
+}
+
+std::size_t MergeIterator::pick() const {
+  std::size_t best = children_.size();
+  for (std::size_t i = 0; i < children_.size(); ++i) {
+    if (batches_[i].empty()) continue;
+    if (best == children_.size() || ahead(i, best)) best = i;
+  }
+  return best;
+}
+
+const InternalKey& MergeIterator::key() const {
+  const_cast<MergeIterator*>(this)->prime();
+  const auto view = child_key(pick());
+  Bytes user;
+  view.materialize_user(user);
+  key_scratch_.assign(user, view.timestamp());
+  return key_scratch_;
+}
 
 InternalKeyView MergeIterator::key_view() const {
-  return children_[top()]->key_view();
+  const_cast<MergeIterator*>(this)->prime();
+  return child_key(pick());
 }
 
-ByteView MergeIterator::value() const { return children_[top()]->value(); }
+ByteView MergeIterator::value() const {
+  const_cast<MergeIterator*>(this)->prime();
+  return child_row(pick()).value;
+}
+
+InternalKeyView MergeIterator::child_key(std::size_t child) const {
+  return child_row(child).key;
+}
+
+ScanRow MergeIterator::child_row(std::size_t child) const {
+  const auto& batch = batches_[child];
+  if (batch.empty()) throw Error("iterator is invalid");
+  return batch.rows[batch.pos];
+}
+
+bool MergeIterator::refill_child(std::size_t child) {
+  auto& batch = batches_[child];
+  std::array<ScanRow, kScanBatch> raw{};
+  const auto n = children_[child]->pull(raw);
+  batch.pos = 0;
+  batch.size = static_cast<std::uint8_t>(n);
+  for (std::uint8_t i = 0; i < batch.size; ++i) {
+    raw[i].key.materialize_user(batch.keys[i]);
+    batch.vals[i].assign(raw[i].value.begin(), raw[i].value.end());
+    batch.rows[i] = {InternalKeyView(batch.keys[i], raw[i].key.timestamp()),
+                     batch.vals[i]};
+  }
+  return !batch.empty();
+}
+
+void MergeIterator::advance_child(std::size_t child) {
+  auto& batch = batches_[child];
+  if (!batch.empty()) ++batch.pos;
+  if (batch.empty()) refill_child(child);
+}
 
 bool MergeIterator::ahead(std::size_t a, std::size_t b) const {
-  const auto order =
-      compare_internal(children_[a]->key_view(), children_[b]->key_view());
+  const auto order = compare_internal(child_key(a), child_key(b));
   if (order != 0) return order < 0;
   return a < b;
 }
 
-void MergeIterator::sift_up(std::size_t index) {
-  while (index > 0) {
-    const std::size_t parent = (index - 1) / 2;
-    if (!ahead(heap_[index], heap_[parent])) return;
-    std::swap(heap_[index], heap_[parent]);
-    index = parent;
-  }
-}
-
-void MergeIterator::sift_down(std::size_t index) {
-  for (;;) {
-    std::size_t best = index;
-    const std::size_t left = index * 2 + 1;
-    const std::size_t right = left + 1;
-    if (left < heap_.size() && ahead(heap_[left], heap_[best])) best = left;
-    if (right < heap_.size() && ahead(heap_[right], heap_[best])) best = right;
-    if (best == index) return;
-    std::swap(heap_[index], heap_[best]);
-    index = best;
-  }
-}
-
-void MergeIterator::push(std::size_t child) {
-  if (child >= children_.size() || !children_[child]->valid()) return;
-  heap_.push_back(child);
-  sift_up(heap_.size() - 1);
-}
-
-void MergeIterator::pop() {
-  heap_.front() = heap_.back();
-  heap_.pop_back();
-  if (!heap_.empty()) sift_down(0);
-}
-
 void MergeIterator::next() {
-  if (heap_.empty()) return;
-  if (heap_.size() == 1) {
-    auto* child = children_[heap_.front()].get();
-    child->next();
-    if (!child->valid()) heap_.clear();
+  prime();
+  const auto child = pick();
+  if (child == children_.size()) return;
+  if (children_.size() == 1) {
+    advance_child(child);
     return;
   }
-  const auto parked = children_[heap_.front()]->key_view();
+  const auto parked = child_key(child);
   parked.materialize_user(previous_user_);
   previous_timestamp_ = parked.timestamp();
-  while (!heap_.empty()) {
-    const auto current = children_[heap_.front()]->key_view();
-    if (!same_user(current, previous_user_) ||
-        current.timestamp() != previous_timestamp_) {
+  while (pick() != children_.size()) {
+    const auto current = pick();
+    const auto view = child_key(current);
+    if (!same_user(view, previous_user_) ||
+        view.timestamp() != previous_timestamp_) {
       break;
     }
-    const auto child = heap_.front();
-    pop();
-    children_[child]->next();
-    push(child);
+    advance_child(current);
   }
 }
 
 void MergeIterator::skip_current_user() {
-  if (heap_.empty()) return;
-  if (heap_.size() == 1) {
-    auto* child = children_[heap_.front()].get();
-    child->skip_current_user();
-    if (!child->valid()) heap_.clear();
-    return;
+  prime();
+  const auto first = pick();
+  if (first == children_.size()) return;
+  child_key(first).materialize_user(previous_user_);
+  for (std::size_t i = 0; i < children_.size(); ++i) {
+    while (!batches_[i].empty()) {
+      auto& batch = batches_[i];
+      const auto n = leading_same_user(
+          std::span<const ScanRow>{
+              batch.rows.data() + batch.pos,
+              static_cast<std::size_t>(batch.size - batch.pos)},
+          previous_user_);
+      batch.pos = static_cast<std::uint8_t>(batch.pos + n);
+      if (!batch.empty()) break;
+      refill_child(i);
+    }
   }
-  children_[heap_.front()]->key_view().materialize_user(previous_user_);
-  while (!heap_.empty() &&
-         same_user(children_[heap_.front()]->key_view(), previous_user_)) {
-    const auto child = heap_.front();
-    pop();
-    children_[child]->skip_current_user();
-    push(child);
+}
+
+std::size_t MergeIterator::pull(std::span<ScanRow> out) {
+  std::size_t n = 0;
+  while (n < out.size()) {
+    prime();
+    const auto child = pick();
+    if (child == children_.size()) break;
+    const auto row = child_row(child);
+    row.key.materialize_user(out_keys_[n]);
+    out_vals_[n].assign(row.value.begin(), row.value.end());
+    out[n] = {InternalKeyView(out_keys_[n], row.key.timestamp()), out_vals_[n]};
+    ++n;
+    ++batches_[child].pos;
+    if (batches_[child].empty()) refill_child(child);
   }
+  return n;
 }
 
 RangeIterator::RangeIterator(IteratorPtr child,
@@ -173,6 +220,20 @@ ByteView RangeIterator::value() const {
 
 void RangeIterator::next() {
   if (valid()) child_->next();
+}
+
+std::size_t RangeIterator::pull(std::span<ScanRow> out) {
+  if (!valid()) return 0;
+  const auto n = child_->pull(out);
+  std::size_t keep = 0;
+  while (keep < n) {
+    if (upper_) {
+      const auto order = compare_internal(out[keep].key, as_view(*upper_));
+      if (order > 0 || (!upper_inclusive_ && order == 0)) break;
+    }
+    ++keep;
+  }
+  return keep;
 }
 
 void RangeIterator::skip_to_lower() {

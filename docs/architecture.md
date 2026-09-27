@@ -109,9 +109,12 @@ disables it). The cache is split into up to 16 shard LRUs so Gets do not
 share one mutex. The first visible version at the read timestamp wins; an
 empty value is a tombstone.
 
-`Scan` is a move-only cursor over one state snapshot. Memtable and SST
-sources are seeked, heap-merged by `InternalKey` (newer sources win on
-ties), then collapsed to the newest visible user key. Tombstones and
+`Scan` is a move-only cursor over one state snapshot. Sources pull
+16-row batches (one restart interval). Memtable and SST batches are
+merged by `InternalKey` (newer sources win on ties), then collapsed
+to the newest visible user key. User-key compares and same-user skips
+use 16-byte NEON/SSE2 paths when the key is contiguous. Public `next()`
+pops the filtered batch. Tombstones and
 keys outside the requested bounds are skipped as the cursor advances.
 SST scans admit blocks as non-point cache entries (they cannot evict
 point-read blocks). A cache miss reads the current block plus the next four
@@ -123,6 +126,14 @@ after `DB::Close`; a transaction scan must be consumed before `Commit`
 and is invalid after the transaction completes.
 
 ## SST layout and compression
+
+Data blocks prefix-compress keys against the last restart (every 16
+entries, overlap 0). Seek binary-searches restart keys, then scans at
+most 15 entries. The block footer stores entry offsets, the restart
+interval, and an `RST1` magic so older offset-only footers still decode.
+
+Checksums stay CRC-32 (zlib polynomial) for compatibility. ARM uses the
+CRC32 instruction; other CPUs use slicing-by-8. This is not CRC-32C.
 
 Uncompressed tables (`Compression::none`, default) keep the original block
 concatenation plus checksums.

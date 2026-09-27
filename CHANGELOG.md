@@ -13,10 +13,17 @@
 
 ### Changed
 
+- Scan sources pull 16-row batches (one restart interval). `DbIterator`
+  still exposes one row at a time. User-key compare and same-user skip
+  use 16-byte NEON/SSE2 vectors.
+- SST data blocks use restart interval 16: keys compress against the last
+  restart, and `BlockIterator::seek` binary-searches restart keys.
+- `checksum` / WAL CRC-32 keep the zlib polynomial. ARM uses the CRC32
+  instruction; other CPUs use slicing-by-8.
 - SST scan cache misses read the current block plus the next four in one
   `pread`, insert them as non-point cache entries, and hint kernel readahead.
 - `Scan` is a move-only lazy cursor: memtable and SST sources are seeked,
-  heap-merged, then collapsed to the newest visible user key. Memory stays
+  batch-merged, then collapsed to the newest visible user key. Memory stays
   proportional to source count and the current block, not result size.
   Transaction scans overlay a workspace snapshot and record the read set as
   rows are emitted. Consume a transaction scan before `Commit`.

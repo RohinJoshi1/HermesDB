@@ -653,7 +653,11 @@ class TableCursor final : public StorageIterator {
     load_block(true, lower);
   }
 
-  [[nodiscard]] bool valid() const noexcept override { return valid_; }
+  [[nodiscard]] bool valid() const noexcept override {
+    return valid_ && block_iter_ != nullptr &&
+           (block_iter_->valid() ||
+            block_index_ + 1 < table_->num_blocks());
+  }
 
   [[nodiscard]] const InternalKey& key() const override {
     if (!valid_ || block_iter_ == nullptr) throw Error("iterator is invalid");
@@ -685,6 +689,26 @@ class TableCursor final : public StorageIterator {
     next();
     while (valid_ && same_user(key_view(), parked)) next();
     static_cast<void>(pin);
+  }
+
+  std::size_t pull(std::span<ScanRow> out) override {
+    if (!valid_ || block_iter_ == nullptr) return 0;
+    auto got = block_iter_->pull(out);
+    if (got == 0) {
+      ++block_index_;
+      load_block(false, InternalKey{});
+      if (!valid_ || block_iter_ == nullptr) return 0;
+      got = block_iter_->pull(out);
+    }
+    if (got == 0) return 0;
+    if (!upper_.has_value()) return got;
+    std::size_t keep = 0;
+    while (keep < got &&
+           compare_internal(out[keep].key, as_view(*upper_)) < 0) {
+      ++keep;
+    }
+    if (keep != got) valid_ = false;
+    return keep;
   }
 
  private:

@@ -1193,6 +1193,7 @@ struct DbIterator::Impl {
   ByteView value_view;
   mutable Bytes key_buffer;
   mutable bool key_materialized{false};
+  RowBatch incoming;
   bool valid{false};
   bool parked_base{false};
   bool parked_workspace{false};
@@ -1236,17 +1237,37 @@ struct DbIterator::Impl {
     return in_bounds(InternalKeyView(key, 0));
   }
 
-  // Leave merge on the next visible, in-bounds, non-tombstone version.
+  void ensure_incoming() {
+    if (!incoming.empty() || merge == nullptr) return;
+    incoming.reset();
+    incoming.size = static_cast<std::uint8_t>(
+        merge->pull({incoming.rows.data(), kScanBatch}));
+    if (incoming.empty()) merge.reset();
+  }
+
+  void skip_user_in_stream(const InternalKeyView& user) {
+    Bytes parked;
+    user.materialize_user(parked);
+    for (;;) {
+      ensure_incoming();
+      incoming.skip_same_user(parked);
+      if (!incoming.empty() || merge == nullptr || !merge->valid()) return;
+    }
+  }
+
+  // Leave incoming on the next visible, in-bounds, non-tombstone version.
   void position_base() {
     if (merge == nullptr) return;
-    while (merge->valid()) {
-      const auto row = merge->key_view();
-      if (row.timestamp() > read_timestamp) {
-        merge->next();
+    for (;;) {
+      ensure_incoming();
+      if (incoming.empty()) return;
+      const auto& row = incoming.current();
+      if (row.key.timestamp() > read_timestamp) {
+        incoming.pop();
         continue;
       }
-      if (merge->value().empty() || !in_bounds(row)) {
-        merge->skip_current_user();
+      if (row.value.empty() || !in_bounds(row.key)) {
+        skip_user_in_stream(row.key);
         continue;
       }
       return;
@@ -1275,7 +1296,7 @@ struct DbIterator::Impl {
   }
 
   void take_base() {
-    emit(merge->key_view(), merge->value());
+    emit(incoming.current().key, incoming.current().value);
     parked_base = true;
   }
 
@@ -1286,25 +1307,25 @@ struct DbIterator::Impl {
     key_materialized = false;
     if (!overlay) {
       position_base();
-      if (merge == nullptr || !merge->valid()) return;
+      if (incoming.empty()) return;
       take_base();
       return;
     }
     for (;;) {
       position_base();
       skip_workspace();
-      const bool have_base = merge != nullptr && merge->valid();
+      const bool have_base = !incoming.empty();
       const bool have_ws = workspace_it != workspace.end();
       if (!have_base && !have_ws) return;
       if (!have_ws ||
           (have_base &&
-           compare_user(merge->key_view(), workspace_it->first) < 0)) {
+           compare_user(incoming.current().key, workspace_it->first) < 0)) {
         take_base();
         return;
       }
       const bool same =
-          have_base && same_user(merge->key_view(), workspace_it->first);
-      if (same) merge->skip_current_user();
+          have_base && same_user(incoming.current().key, workspace_it->first);
+      if (same) skip_user_in_stream(incoming.current().key);
       if (workspace_it->second.empty()) {
         ++workspace_it;
         continue;
@@ -1317,7 +1338,7 @@ struct DbIterator::Impl {
 
   void advance() {
     if (parked_base) {
-      merge->skip_current_user();
+      skip_user_in_stream(row_key);
       parked_base = false;
     } else if (parked_workspace) {
       ++workspace_it;
