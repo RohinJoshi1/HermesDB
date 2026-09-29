@@ -51,7 +51,8 @@ commit mutex.
 1. Claim a timestamp (`fetch_add` on a writer-only cache line).
 2. Encode an MVCC WAL frame (if WAL is enabled) and **MPSC-enqueue** it.
    The frame is in memory; it is not necessarily on disk yet.
-3. Insert `(InternalKey(user, timestamp), value)` into the mutable skip list.
+3. Copy `(user, timestamp, value)` straight into the mutable skip list's
+   arena.
 4. Mark that timestamp READY and try to close the consecutive prefix. Put
    **does not wait** for other keys’ timestamps. `next_timestamp` and
    `visible_timestamp` sit on separate cache lines.
@@ -85,14 +86,23 @@ paths are not the YCSB `Put` path.
 The memtable is one skip list per table (mutable or immutable), not a
 `std::map` and not sharded maps.
 
+- Nodes and values live in a per-memtable **arena** (64 KiB blocks, atomic
+  bump pointer, mutex only to add a block). Nothing is freed individually;
+  dropping a flushed memtable releases its blocks. A node is one allocation:
+  header, a tower sized to its height, then the user key bytes. With 16-byte
+  keys and 100-byte values the arena holds about 163 bytes per entry
+  (1.32× payload).
 - Nodes are **insert-only** until the whole table is destroyed. A tombstone
   is a new node with an empty value.
 - Height is geometric (max 16). Search follows `next` with acquire loads.
-- Insert locks predecessor nodes in address order, validates links, then
-  splices. Two Puts of the **same user key** with **different timestamps**
-  are different nodes and can proceed concurrently.
-- Overwriting the exact same `InternalKey` (same user key and timestamp)
-  updates that node’s value under the node mutex.
+- Insert CAS-splices level 0, then links higher levels best-effort. Two Puts
+  of the **same user key** with **different timestamps** are different nodes
+  and can proceed concurrently.
+- Values are immutable once published. Overwriting the exact same
+  `InternalKey` (same user key and timestamp) swaps in a new value record
+  with an atomic exchange; readers take no lock, and a view of the old value
+  stays valid for the table's lifetime. Memtable scans therefore return
+  views instead of copying values.
 
 Flush copies `entries()` in key order into an SST. After freeze, that table
 should not receive new Puts.
@@ -175,7 +185,7 @@ failures on a complete frame are errors.
 
 ## Source layout
 
-- `src/memtable/` — skip list
+- `src/memtable/` — skip list and arena
 - `src/storage/` — `DB`, freeze/flush/compaction orchestration, timestamps
 - `src/persistence/` — WAL + MANIFEST
 - `src/block/`, `src/table/` — SST blocks, Bloom, packed compression

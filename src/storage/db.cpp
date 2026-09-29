@@ -874,11 +874,6 @@ struct DB::Impl {
       return timestamps.visible();
     }
     const auto timestamp = timestamps.claim();
-    std::vector<KeyValue> versioned;
-    versioned.reserve(entries.size());
-    for (const auto& [key, value] : entries) {
-      versioned.emplace_back(InternalKey(key, timestamp), value);
-    }
     std::shared_ptr<MemTable> current;
     std::shared_ptr<persistence::MvccWal> wal;
     struct Complete {
@@ -926,7 +921,7 @@ struct DB::Impl {
       counters.wal_bytes.fetch_add(mvcc_wal_frame_bytes(entries),
                                    std::memory_order_relaxed);
     }
-    current->put_batch(versioned);
+    current->put_batch(entries, timestamp);
     std::uint64_t user_bytes = 0;
     for (const auto& [key, value] : entries)
       user_bytes += key.size() + value.size();
@@ -1114,7 +1109,8 @@ struct DB::Impl {
     std::ostringstream out;
     out << "mutable_memtable=" << snapshot->mutable_memtable.id
         << " entries=" << snapshot->mutable_memtable.table->entries().size()
-        << '\n';
+        << " arena_bytes="
+        << snapshot->mutable_memtable.table->memory_usage() << '\n';
     out << "immutable_memtables=" << snapshot->immutable_memtables.size()
         << '\n';
     for (std::size_t index = 0;

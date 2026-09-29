@@ -1,6 +1,9 @@
+#include "hermesdb/arena.hpp"
 #include "hermesdb/db.hpp"
 #include "hermesdb/memtable.hpp"
 
+#include <array>
+#include <atomic>
 #include <barrier>
 #include <cassert>
 #include <chrono>
@@ -176,6 +179,69 @@ void test_concurrent_writes_remain_visible() {
   }
 }
 
+void test_arena_alignment_and_concurrency() {
+  Arena arena(1024);
+  const auto base = arena.memory_usage();
+  auto* small = static_cast<std::byte*>(arena.allocate(3));
+  assert(reinterpret_cast<std::uintptr_t>(small) % Arena::kAlign == 0);
+  auto* large = static_cast<std::byte*>(arena.allocate(4096));
+  assert(reinterpret_cast<std::uintptr_t>(large) % Arena::kAlign == 0);
+  assert(arena.memory_usage() >= base + 4096);
+
+  constexpr int threads = 8;
+  constexpr int per_thread = 2000;
+  std::vector<std::vector<std::uint64_t*>> slots(threads);
+  std::vector<std::thread> workers;
+  for (int t = 0; t < threads; ++t) {
+    workers.emplace_back([&, t] {
+      for (int i = 0; i < per_thread; ++i) {
+        auto* slot = static_cast<std::uint64_t*>(arena.allocate(24));
+        slot[0] = static_cast<std::uint64_t>(t);
+        slot[1] = static_cast<std::uint64_t>(i);
+        slot[2] = ~slot[0];
+        slots[static_cast<std::size_t>(t)].push_back(slot);
+      }
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  for (int t = 0; t < threads; ++t) {
+    for (int i = 0; i < per_thread; ++i) {
+      const auto* slot =
+          slots[static_cast<std::size_t>(t)][static_cast<std::size_t>(i)];
+      assert(slot[0] == static_cast<std::uint64_t>(t));
+      assert(slot[1] == static_cast<std::uint64_t>(i));
+      assert(slot[2] == ~slot[0]);
+    }
+  }
+}
+
+void test_overwrite_keeps_reader_views_valid() {
+  auto table = std::make_shared<MemTable>();
+  table->put(as_bytes("k"), 7, as_bytes("first"));
+  auto cursor = MemTable::iter_from(table, InternalKey("k", kMaxTimestamp));
+  std::array<ScanRow, kScanBatch> rows{};
+  assert(cursor->pull(rows) == 1);
+
+  std::atomic<bool> stop{false};
+  std::thread writer([&] {
+    for (int i = 0; !stop.load(); ++i) {
+      table->put(as_bytes("k"), 7,
+                 as_bytes(i % 2 == 0 ? "second-longer" : "third"));
+    }
+  });
+  for (int i = 0; i < 20000; ++i) {
+    const auto value = table->get(as_bytes("k"), 7);
+    assert(value.has_value());
+    const auto text_value = as_string(*value);
+    assert(text_value == "first" || text_value == "second-longer" ||
+           text_value == "third");
+  }
+  stop.store(true);
+  writer.join();
+  assert(as_string(rows[0].value) == "first");
+  assert(table->entries().size() == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -185,5 +251,7 @@ int main() {
   test_concurrent_force_freeze_never_publishes_empty_memtable();
   test_concurrent_timestamp_versions();
   test_concurrent_writes_remain_visible();
+  test_arena_alignment_and_concurrency();
+  test_overwrite_keeps_reader_views_valid();
   std::cout << "Memtable tests passed\n";
 }

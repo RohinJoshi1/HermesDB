@@ -37,6 +37,7 @@ endif()
 add_library(hermesdb
   src/common/common.cpp
   src/key/key.cpp
+  src/memtable/arena.cpp
   src/memtable/memtable.cpp
   src/iterators/iterators.cpp
   src/storage/db.cpp

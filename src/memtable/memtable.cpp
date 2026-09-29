@@ -1,12 +1,14 @@
 #include "hermesdb/memtable.hpp"
+#include "hermesdb/arena.hpp"
 #include "hermesdb/iterator.hpp"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <memory>
-#include <mutex>
+#include <new>
 #include <random>
+#include <type_traits>
 #include <vector>
 
 namespace hermesdb {
@@ -23,91 +25,136 @@ int random_height() {
 
 }  // namespace
 
+// Nodes and values live in the memtable's arena and are never freed
+// individually. A value is immutable once published; an overwrite of the
+// same (key, timestamp) publishes a new record, so readers need no lock.
 struct MemTable::SkipList {
-  struct Node {
-    Node(InternalKey key_arg, Bytes value_arg, int height_arg)
-        : key(std::move(key_arg)),
-          value(std::move(value_arg)),
-          height(height_arg) {
-      for (auto& link : next) link.store(nullptr, std::memory_order_relaxed);
+  struct ValueRecord {
+    std::uint64_t size;
+    [[nodiscard]] ByteView view() const noexcept {
+      return {reinterpret_cast<const Byte*>(this + 1),
+              static_cast<std::size_t>(size)};
     }
-
-    InternalKey key;
-    Bytes value;
-    const int height;
-    mutable std::mutex mutex;
-    std::array<std::atomic<Node*>, kMaxHeight> next{};
   };
 
-  SkipList() : head_(InternalKey(), Bytes{}, kMaxHeight) {}
+  // Layout: Node | std::atomic<Node*>[height] | user key bytes.
+  struct Node {
+    std::atomic<const ValueRecord*> value;
+    std::uint64_t timestamp;
+    std::uint32_t key_size;
+    std::uint32_t height;
 
-  ~SkipList() {
-    Node* node = head_.next[0].load(std::memory_order_relaxed);
-    while (node != nullptr) {
-      Node* successor = node->next[0].load(std::memory_order_relaxed);
-      delete node;
-      node = successor;
+    [[nodiscard]] std::atomic<Node*>* tower() noexcept {
+      return std::launder(reinterpret_cast<std::atomic<Node*>*>(
+          reinterpret_cast<std::byte*>(this) + sizeof(Node)));
     }
-  }
+    [[nodiscard]] const std::atomic<Node*>* tower() const noexcept {
+      return const_cast<Node*>(this)->tower();
+    }
+    [[nodiscard]] std::atomic<Node*>& next(int level) noexcept {
+      return tower()[level];
+    }
+    [[nodiscard]] ByteView user_key() const noexcept {
+      return {reinterpret_cast<const Byte*>(tower() + height), key_size};
+    }
+    [[nodiscard]] InternalKeyView view() const noexcept {
+      return {user_key(), timestamp};
+    }
+    [[nodiscard]] ByteView value_view() const noexcept {
+      return value.load(std::memory_order_acquire)->view();
+    }
+  };
+  static_assert(sizeof(Node) % alignof(std::atomic<Node*>) == 0);
+  static_assert(std::is_trivially_destructible_v<std::atomic<Node*>>);
+
+  SkipList() : head_(make_node({}, &kEmptyValue, kMaxHeight)) {}
 
   SkipList(const SkipList&) = delete;
   SkipList& operator=(const SkipList&) = delete;
 
-  [[nodiscard]] Node* load(const std::atomic<Node*>& link) const {
+  [[nodiscard]] static Node* load(const std::atomic<Node*>& link) {
     return link.load(std::memory_order_acquire);
   }
 
-  bool find(const InternalKey& key, std::array<Node*, kMaxHeight>& preds,
+  [[nodiscard]] Node* make_node(InternalKeyView key, const ValueRecord* value,
+                                int height) {
+    const auto user = key.prefix();
+    const std::size_t tower_bytes =
+        static_cast<std::size_t>(height) * sizeof(std::atomic<Node*>);
+    void* memory = arena_.allocate(sizeof(Node) + tower_bytes + user.size());
+    auto* node = new (memory) Node{};
+    node->value.store(value, std::memory_order_relaxed);
+    node->timestamp = key.timestamp();
+    node->key_size = static_cast<std::uint32_t>(user.size());
+    node->height = static_cast<std::uint32_t>(height);
+    auto* links = reinterpret_cast<std::byte*>(node) + sizeof(Node);
+    for (int level = 0; level < height; ++level) {
+      new (links + static_cast<std::size_t>(level) * sizeof(std::atomic<Node*>))
+          std::atomic<Node*>(nullptr);
+    }
+    if (!user.empty()) {
+      std::memcpy(links + tower_bytes, user.data(), user.size());
+    }
+    return node;
+  }
+
+  [[nodiscard]] const ValueRecord* make_value(ByteView value) {
+    if (value.empty()) return &kEmptyValue;
+    void* memory = arena_.allocate(sizeof(ValueRecord) + value.size());
+    auto* record = new (memory) ValueRecord{value.size()};
+    std::memcpy(record + 1, value.data(), value.size());
+    return record;
+  }
+
+  bool find(const InternalKeyView& key, std::array<Node*, kMaxHeight>& preds,
             std::array<Node*, kMaxHeight>& succs) const {
-    Node* pred = const_cast<Node*>(&head_);
+    Node* pred = head_;
     for (int level = kMaxHeight - 1; level >= 0; --level) {
-      Node* current = load(pred->next[static_cast<std::size_t>(level)]);
-      while (current != nullptr && current->key < key) {
+      Node* current = load(pred->next(level));
+      while (current != nullptr && compare_internal(current->view(), key) < 0) {
         pred = current;
-        current = load(pred->next[static_cast<std::size_t>(level)]);
+        current = load(pred->next(level));
       }
       preds[static_cast<std::size_t>(level)] = pred;
       succs[static_cast<std::size_t>(level)] = current;
     }
     Node* match = succs[0];
-    return match != nullptr && match->key == key;
+    return match != nullptr && compare_internal(match->view(), key) == 0;
   }
 
-  void insert(const InternalKey& key, Bytes value) {
+  void insert(ByteView user_key, std::uint64_t timestamp, ByteView value) {
+    const InternalKeyView key(user_key, timestamp);
+    const ValueRecord* record = make_value(value);
     std::array<Node*, kMaxHeight> preds{};
     std::array<Node*, kMaxHeight> succs{};
     const int height = random_height();
-    auto* node = new Node(key, std::move(value), height);
+    Node* node = nullptr;
 
     for (;;) {
       if (find(key, preds, succs)) {
-        Node* existing = succs[0];
-        std::lock_guard lock(existing->mutex);
-        const auto old = existing->value.size();
-        existing->value = std::move(node->value);
-        delete node;
-        if (existing->value.size() >= old) {
-          approximate_size_.fetch_add(existing->value.size() - old,
+        const auto* old = succs[0]->value.exchange(record,
+                                                   std::memory_order_acq_rel);
+        if (record->size >= old->size) {
+          approximate_size_.fetch_add(record->size - old->size,
                                       std::memory_order_relaxed);
         } else {
-          approximate_size_.fetch_sub(old - existing->value.size(),
+          approximate_size_.fetch_sub(old->size - record->size,
                                       std::memory_order_relaxed);
         }
         return;
       }
-
-      node->next[0].store(succs[0], std::memory_order_relaxed);
+      if (node == nullptr) node = make_node(key, record, height);
+      node->next(0).store(succs[0], std::memory_order_relaxed);
       Node* expected = succs[0];
-      if (preds[0]->next[0].compare_exchange_strong(
+      if (preds[0]->next(0).compare_exchange_strong(
               expected, node, std::memory_order_release,
               std::memory_order_acquire)) {
         break;
       }
     }
 
-    approximate_size_.fetch_add(
-        node->key.user_key().size() + 8 + node->value.size(),
-        std::memory_order_relaxed);
+    approximate_size_.fetch_add(user_key.size() + 8 + value.size(),
+                                std::memory_order_relaxed);
 
     int top = max_height_.load(std::memory_order_relaxed);
     while (height > top && !max_height_.compare_exchange_weak(
@@ -120,9 +167,9 @@ struct MemTable::SkipList {
       const auto index = static_cast<std::size_t>(level);
       for (;;) {
         static_cast<void>(find(key, preds, succs));
-        node->next[index].store(succs[index], std::memory_order_relaxed);
+        node->next(level).store(succs[index], std::memory_order_relaxed);
         Node* expected = succs[index];
-        if (preds[index]->next[index].compare_exchange_strong(
+        if (preds[index]->next(level).compare_exchange_strong(
                 expected, node, std::memory_order_release,
                 std::memory_order_acquire)) {
           break;
@@ -131,19 +178,24 @@ struct MemTable::SkipList {
     }
   }
 
-  [[nodiscard]] Node* lower_bound(const InternalKey& key) const {
-    Node* pred = const_cast<Node*>(&head_);
+  [[nodiscard]] Node* lower_bound(const InternalKeyView& key) const {
+    Node* pred = head_;
     for (int level = kMaxHeight - 1; level >= 0; --level) {
-      Node* current = load(pred->next[static_cast<std::size_t>(level)]);
-      while (current != nullptr && current->key < key) {
+      Node* current = load(pred->next(level));
+      while (current != nullptr && compare_internal(current->view(), key) < 0) {
         pred = current;
-        current = load(pred->next[static_cast<std::size_t>(level)]);
+        current = load(pred->next(level));
       }
     }
-    return load(pred->next[0]);
+    return load(pred->next(0));
   }
 
-  Node head_;
+  [[nodiscard]] Node* first() const { return load(head_->next(0)); }
+
+  static constexpr ValueRecord kEmptyValue{0};
+
+  Arena arena_;
+  Node* head_;
   std::atomic<int> max_height_{1};
   std::atomic<std::size_t> approximate_size_{0};
 };
@@ -154,8 +206,7 @@ MemTable::~MemTable() = default;
 void MemTable::put(ByteView key, ByteView value) { put(key, 0, value); }
 
 void MemTable::put(ByteView key, std::uint64_t timestamp, ByteView value) {
-  list_->insert(InternalKey(Bytes(key.begin(), key.end()), timestamp),
-                Bytes(value.begin(), value.end()));
+  list_->insert(key, timestamp, value);
 }
 
 void MemTable::put(std::string_view key, std::string_view value) {
@@ -175,14 +226,17 @@ void MemTable::erase(std::string_view key, std::uint64_t timestamp) {
   erase(as_bytes(key), timestamp);
 }
 
-void MemTable::put_batch(std::span<const std::pair<Bytes, Bytes>> entries) {
+void MemTable::put_batch(std::span<const std::pair<Bytes, Bytes>> entries,
+                         std::uint64_t timestamp) {
   for (const auto& [key, value] : entries) {
-    list_->insert(InternalKey(key), value);
+    list_->insert(key, timestamp, value);
   }
 }
 
 void MemTable::put_batch(std::span<const KeyValue> entries) {
-  for (const auto& [key, value] : entries) list_->insert(key, value);
+  for (const auto& [key, value] : entries) {
+    list_->insert(key.user_key(), key.timestamp(), value);
+  }
 }
 
 std::optional<Bytes> MemTable::get(ByteView key) const {
@@ -191,15 +245,13 @@ std::optional<Bytes> MemTable::get(ByteView key) const {
 
 std::optional<Bytes> MemTable::get(ByteView key,
                                    std::uint64_t read_timestamp) const {
-  const InternalKey target(Bytes(key.begin(), key.end()), read_timestamp);
-  SkipList::Node* node = list_->lower_bound(target);
-  if (node == nullptr ||
-      !std::equal(node->key.user_key().begin(), node->key.user_key().end(),
-                  key.begin(), key.end())) {
+  SkipList::Node* node =
+      list_->lower_bound(InternalKeyView(key, read_timestamp));
+  if (node == nullptr || compare_bytes(node->user_key(), key) != 0) {
     return std::nullopt;
   }
-  std::lock_guard lock(node->mutex);
-  return node->value;
+  const auto value = node->value_view();
+  return Bytes(value.begin(), value.end());
 }
 
 std::optional<Bytes> MemTable::get(std::string_view key) const {
@@ -213,10 +265,13 @@ std::optional<Bytes> MemTable::get(std::string_view key,
 
 std::vector<KeyValue> MemTable::entries() const {
   std::vector<KeyValue> all;
-  for (auto* node = list_->load(list_->head_.next[0]); node != nullptr;
-       node = list_->load(node->next[0])) {
-    std::lock_guard lock(node->mutex);
-    all.emplace_back(node->key, node->value);
+  for (auto* node = list_->first(); node != nullptr;
+       node = SkipList::load(node->next(0))) {
+    const auto user = node->user_key();
+    const auto value = node->value_view();
+    all.emplace_back(InternalKey(Bytes(user.begin(), user.end()),
+                                 node->timestamp),
+                     Bytes(value.begin(), value.end()));
   }
   return all;
 }
@@ -225,16 +280,18 @@ std::size_t MemTable::approximate_size() const {
   return list_->approximate_size_.load(std::memory_order_relaxed);
 }
 
-bool MemTable::empty() const {
-  return list_->load(list_->head_.next[0]) == nullptr;
+std::size_t MemTable::memory_usage() const {
+  return list_->arena_.memory_usage();
 }
+
+bool MemTable::empty() const { return list_->first() == nullptr; }
 
 class MemTable::Cursor final : public StorageIterator {
  public:
   Cursor(std::shared_ptr<MemTable> owner, SkipList* list,
          const InternalKey& lower, std::optional<InternalKey> upper)
       : owner_(std::move(owner)), list_(list), upper_(std::move(upper)) {
-    node_ = list_->lower_bound(lower);
+    node_ = list_->lower_bound(as_view(lower));
     load();
   }
 
@@ -242,12 +299,13 @@ class MemTable::Cursor final : public StorageIterator {
 
   [[nodiscard]] const InternalKey& key() const override {
     if (!valid_ || node_ == nullptr) throw Error("iterator is invalid");
-    return node_->key;
+    key_.assign(node_->user_key(), node_->timestamp);
+    return key_;
   }
 
   [[nodiscard]] InternalKeyView key_view() const override {
     if (!valid_ || node_ == nullptr) throw Error("iterator is invalid");
-    return as_view(node_->key);
+    return node_->view();
   }
 
   [[nodiscard]] ByteView value() const override {
@@ -257,16 +315,16 @@ class MemTable::Cursor final : public StorageIterator {
 
   void next() override {
     if (node_ == nullptr) return;
-    node_ = list_->load(node_->next[0]);
+    node_ = SkipList::load(node_->next(0));
     load();
   }
 
+  // Keys and values point into the arena, so rows stay valid for the
+  // memtable's lifetime rather than only until the next pull.
   std::size_t pull(std::span<ScanRow> out) override {
     std::size_t n = 0;
     while (n < out.size() && valid_) {
-      value_slots_[n].assign(value_.begin(), value_.end());
-      out[n] = {as_view(node_->key), value_slots_[n]};
-      ++n;
+      out[n++] = {node_->view(), value_};
       next();
     }
     return n;
@@ -275,15 +333,14 @@ class MemTable::Cursor final : public StorageIterator {
  private:
   void load() {
     valid_ = false;
-    value_.clear();
+    value_ = {};
     if (node_ == nullptr) return;
     if (upper_.has_value() &&
-        compare_internal(as_view(node_->key), as_view(*upper_)) >= 0) {
+        compare_internal(node_->view(), as_view(*upper_)) >= 0) {
       node_ = nullptr;
       return;
     }
-    std::lock_guard lock(node_->mutex);
-    value_ = node_->value;
+    value_ = node_->value_view();
     valid_ = true;
   }
 
@@ -291,8 +348,8 @@ class MemTable::Cursor final : public StorageIterator {
   SkipList* list_{};
   SkipList::Node* node_{};
   std::optional<InternalKey> upper_;
-  Bytes value_;
-  std::array<Bytes, kScanBatch> value_slots_{};
+  ByteView value_;
+  mutable InternalKey key_;
   bool valid_{false};
 };
 

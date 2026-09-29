@@ -92,6 +92,9 @@ Remove avoidable work before introducing specialized I/O:
 - Reduce key/value copies with owned block handles and lifetime-safe views.
 - Scan sources pull 16-row batches (one restart). Public `next()` pops a
   filtered batch. Merge copies the batch so child views can be refilled.
+- Arena-allocated memtable nodes and values; lock-free value reads. Memtable
+  Get no longer allocates a lookup key. The returned `Bytes` still
+  allocates, and SST Get still builds an `InternalKey` target.
 - SIMD user-key compare and same-user skip (NEON / SSE2, 16-byte chunks).
   Scalar memcmp for tails and other lengths.
 

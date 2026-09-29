@@ -13,6 +13,12 @@
 
 ### Changed
 
+- Memtables allocate nodes and values from a concurrent arena. Each Put
+  copies key and value once into it (no per-node `new`, no temporary
+  `InternalKey`), node towers match their height, and the per-node mutex is
+  gone: values are immutable records swapped atomically. `MemTable::get`
+  no longer allocates a lookup key, and memtable scans return views.
+  `DumpStructure` reports `arena_bytes` for the mutable memtable.
 - Scan sources pull 16-row batches (one restart interval). `DbIterator`
   still exposes one row at a time. User-key compare and same-user skip
   use 16-byte NEON/SSE2 vectors.

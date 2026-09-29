@@ -22,7 +22,8 @@ class MemTable {
   void put(std::string_view key, std::uint64_t timestamp, ByteView value);
   void erase(ByteView key, std::uint64_t timestamp);
   void erase(std::string_view key, std::uint64_t timestamp);
-  void put_batch(std::span<const std::pair<Bytes, Bytes>> entries);
+  void put_batch(std::span<const std::pair<Bytes, Bytes>> entries,
+                 std::uint64_t timestamp = 0);
   void put_batch(std::span<const KeyValue> entries);
   [[nodiscard]] std::optional<Bytes> get(ByteView key) const;
   [[nodiscard]] std::optional<Bytes> get(std::string_view key) const;
@@ -40,7 +41,10 @@ class MemTable {
   [[nodiscard]] static IteratorPtr iter_from(
       std::shared_ptr<MemTable> table, const InternalKey& lower,
       std::optional<InternalKey> upper = std::nullopt);
+  // Payload bytes (key + timestamp + value); drives freeze.
   [[nodiscard]] std::size_t approximate_size() const;
+  // Arena bytes reserved, including node towers and block slack.
+  [[nodiscard]] std::size_t memory_usage() const;
   [[nodiscard]] bool empty() const;
 
  private:
